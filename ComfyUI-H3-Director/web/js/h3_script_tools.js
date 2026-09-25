@@ -1,6 +1,20 @@
 /* H3 导演台 · 剧本资产与生产前检查纯函数。
    本文件不依赖 DOM/ComfyUI，可由浏览器和 Node 单元测试共同使用。 */
 
+import { H3_CAP } from "./h3_cap.js";
+
+/* 当前档的 Shot 密度口径（与 h3_studio.js 的 AI 提示词三档文案一致）：
+   approx=每档秒数内建议 Shot 数，max=硬上限，per=通常每镜秒数，cut=快切下限秒。 */
+const H3_SHOT_DENSITY = Object.freeze({
+  8: Object.freeze({ approx: "2–3", max: 4, per: "1.5–4", cut: 1.2 }),
+  10: Object.freeze({ approx: "3–4", max: 5, per: "2–5", cut: 1.4 }),
+  15: Object.freeze({ approx: "3–5", max: 6, per: "2–6", cut: 1.5 }),
+});
+
+function h3ShotDensity() {
+  return H3_SHOT_DENSITY[H3_CAP.sec] || H3_SHOT_DENSITY[8];
+}
+
 export const H3_ASSET_TYPES = Object.freeze({
   character: { label: "角色", prefix: "C", subject: "character" },
   prop: { label: "道具", prefix: "P", subject: "prop" },
@@ -242,12 +256,12 @@ function h3GuidedNumber(value) {
 
 /**
  * 本地逐步填写模式的分段计划。它不调用 AI，也不伪装成官方 Base：只把用户
- * 亲自选择的要求装入 15 秒以内的 Director 普通段，避免长提示词再次按字数
+ * 亲自选择的要求装入当前档上限以内的 Director 普通段，避免长提示词再次按字数
  * 估时并拆成错误数量。
  */
-export function planH3GuidedSegments(durationValue, maxSegmentSeconds = 15) {
+export function planH3GuidedSegments(durationValue, maxSegmentSeconds = H3_CAP.sec) {
   const total = h3GuidedDurationSeconds(durationValue);
-  const maxSeconds = Math.max(5, Math.min(15, Number(maxSegmentSeconds) || 15));
+  const maxSeconds = Math.max(4, Math.min(H3_CAP.sec, Number(maxSegmentSeconds) || H3_CAP.sec));
   const count = Math.max(1, Math.ceil(total / maxSeconds));
   const base = total / count;
   const segments = [];
@@ -348,12 +362,12 @@ export function parseH3GuidedDialogueEntries(value) {
 /**
  * 逐步填写的精确对白使用全片绝对秒数：
  *   0.000–2.000秒｜熊猫｜我一定要拿到那个红苹果。
- * 每句必须完整落在一个不超过15秒的 Director 生成段内，避免跨段截断或重复。
+ * 每句必须完整落在一个不超过当前档上限的 Director 生成段内，避免跨段截断或重复。
  */
 export function validateH3GuidedDialogueScript(value, options = {}) {
   const mode = String(options.mode || "");
   const duration = h3GuidedDurationSeconds(options.duration || "15秒");
-  const segmentSeconds = Math.max(5, Math.min(15, Number(options.segmentSeconds) || 15));
+  const segmentSeconds = Math.max(4, Math.min(H3_CAP.sec, Number(options.segmentSeconds) || H3_CAP.sec));
   const language = String(options.language || "普通话（简体中文）").trim() || "普通话（简体中文）";
   const languageTag = h3GuidedLanguageTag(language);
   const kind = h3GuidedDialogueModeKind(mode);
@@ -456,7 +470,7 @@ function h3GuidedDialogueContract(fields, segment) {
     };
   }
   const validation = validateH3GuidedDialogueScript(fields.dialogue_script, {
-    mode, duration: fields.duration, language: fields.dialogue_language, segmentSeconds: 15,
+    mode, duration: fields.duration, language: fields.dialogue_language, segmentSeconds: H3_CAP.sec,
   });
   if (!validation.ok) {
     return {
@@ -502,7 +516,7 @@ function buildH3GuidedDirectorScriptLegacy(fields = {}, segmentTexts = []) {
   const locked = h3GuidedPairs(fields, productNoCopy ? lockedKeys.filter((key) => key !== "ad_copy") : lockedKeys);
   const executionFields = {
     ...fields,
-    structure: isOfficial3d && plan.count === 1 ? "15秒紧凑4镜因果链" : fields.structure,
+    structure: isOfficial3d && plan.count === 1 ? `${h3GuidedNumber(plan.total)}秒紧凑4镜因果链` : fields.structure,
     sound: h3GuidedSoundForDialogue(fields.sound, fields),
   };
   const execution = h3GuidedPairs(executionFields,
@@ -567,7 +581,7 @@ function buildH3GuidedDirectorScriptLegacy(fields = {}, segmentTexts = []) {
     const nextDuty = concise(cleanDetail(nextDetails, "objective") || cleanDetail(nextDetails, "action"));
     let currentDuty = concise(objective || stage);
     if (isOfficial3d && plan.count === 1) {
-      currentDuty = "在15秒内完成一条紧凑因果链：建立送达任务→发生一次具体失败→改变方法解决障碍→完成交接与情绪回收";
+      currentDuty = `在${h3GuidedNumber(plan.total)}秒内完成一条紧凑因果链：建立送达任务→发生一次具体失败→改变方法解决障碍→完成交接与情绪回收`;
     } else if (isOfficial3d && plan.count === 2) {
       currentDuty = segment.index === 0
         ? "建立主角携带核心道具前往终点的固定路线，发生一次具体失败，并停在唯一可续接状态"
@@ -754,7 +768,7 @@ function h3GuidedVisualLock(fields = {}, copyContract = { mode: "none", copy: ""
 
 /**
  * 将30套逐步填写模板统一编译为可直接解析的官方 Base：完整三字段、后续 Shot
- * 使用全片绝对时间，长片由官方解析器按 Shot 边界局部化为不超过15秒的生成段。
+ * 使用全片绝对时间，长片由官方解析器按 Shot 边界局部化为不超过当前档上限的生成段。
  * 本函数纯本地执行，不调用 AI。
  */
 export function buildH3GuidedDirectorScript(fields = {}, segmentTexts = []) {
@@ -1561,7 +1575,7 @@ export function validateH3NarrativeExecutionQuality(value, {
   return { ok: !issues.some((issue) => issue.severity === "error"), issues };
 }
 
-/** 检查 H3 可执行镜头密度。一个 15 秒生成段不应承担十几个亚秒级 Shot。 */
+/** 检查 H3 可执行镜头密度。一个生成段不应承担十几个亚秒级 Shot。 */
 export function validateH3ShotExecutionQuality({
   shots = [], duration = 0, text = "", checkNarrative = true,
   referenceCount = -1, tailContinuation = false,
@@ -1646,18 +1660,20 @@ export function validateH3ShotExecutionQuality({
   const average = totalDuration > 0 ? totalDuration / normalized.length : 0;
   if (average > 0 && average < 2 - 0.001) {
     push("error", "shot_average_too_short",
-      `${totalDuration.toFixed(1)} 秒被拆成 ${normalized.length} 个 Shot，平均只有 ${average.toFixed(2)} 秒。建议30秒约6–10镜、每15秒约3–5镜。`);
+      `${totalDuration.toFixed(1)} 秒被拆成 ${normalized.length} 个 Shot，平均只有 ${average.toFixed(2)} 秒。建议30秒约6–10镜、每${H3_CAP.sec}秒约${h3ShotDensity().approx}镜。`);
   }
   if (totalDuration > 0) {
-    for (let start = 0; start < totalDuration - 0.001; start += 15) {
-      const end = Math.min(totalDuration, start + 15);
+    const densityWindow = H3_CAP.sec;
+    const density = h3ShotDensity();
+    for (let start = 0; start < totalDuration - 0.001; start += densityWindow) {
+      const end = Math.min(totalDuration, start + densityWindow);
       const count = normalized.filter((shot) => shot.start >= start - 0.001 && shot.start < end - 0.001).length;
-      if (count > 6) {
+      if (count > density.max) {
         push("error", "shot_density_overload",
-          `${start.toFixed(1)}–${end.toFixed(1)}秒包含 ${count} 个 Shot，超过H3稳定执行范围；请压缩到约3–5个，最多不超过6个。`, { time: start });
-      } else if (count === 6) {
+          `${start.toFixed(1)}–${end.toFixed(1)}秒包含 ${count} 个 Shot，超过H3稳定执行范围；请压缩到约${density.approx}个，最多不超过${density.max}个。`, { time: start });
+      } else if (count === density.max) {
         push("warn", "shot_density_high",
-          `${start.toFixed(1)}–${end.toFixed(1)}秒包含6个 Shot，已接近上限；复杂动作建议进一步合并。`, { time: start });
+          `${start.toFixed(1)}–${end.toFixed(1)}秒包含${density.max}个 Shot，已接近上限；复杂动作建议进一步合并。`, { time: start });
       }
     }
   }
@@ -1800,7 +1816,8 @@ export function buildH3TimelineRepairInstruction(contract, issues = [], { mode =
   const issueCodes = new Set((issues || []).map((issue) => String(issue.code || "")));
   const qualityRules = [];
   if ([...issueCodes].some((code) => /shot_|short_shot|scene_density/.test(code))) {
-    qualityRules.push("重新合并过碎镜头：每15秒约3–5个Shot、最多6个；通常每镜2–6秒，任何特殊快切不得低于1.5秒；一个Shot只承担一个主要动作。不得通过增加Shot数量保留微动作。 ");
+    const dShot = h3ShotDensity();
+    qualityRules.push(`重新合并过碎镜头：每${H3_CAP.sec}秒约${dShot.approx}个Shot、最多${dShot.max}个；通常每镜${dShot.per}秒，任何特殊快切不得低于${dShot.cut}秒；一个Shot只承担一个主要动作。不得通过增加Shot数量保留微动作。 `);
   }
   if (issueCodes.has("pixel_3d_camera_conflict") || issueCodes.has("pixel_spatial_camera_risk")) {
     qualityRules.push("原生2D像素阶段删除环绕旋转、低机位空间跟拍、立体通道、PBR、体积光、真实毛发和写实景深；只使用固定侧视/俯视、横纵卷轴、视差背景、Sprite帧动画、画面缩放和屏幕震动。 ");
@@ -3250,7 +3267,7 @@ export function validateH3ProductionPlan({ sourceText = "", segments = [], catal
       push("error", "director_manifest_leak", `第 ${n} 段包含 director_import_manifest；该清单只能用于导演台导入，不能发送给 H3。`, n);
     }
     if (segment.duration > 0 && segment.duration < 5 - 0.01) push("warn", "short_segment", `第 ${n} 段 ${segment.duration.toFixed(1)} 秒，低于短剧建议的 5 秒。`, n);
-    if (segment.duration > 15.1) push("error", "long_segment", `第 ${n} 段 ${segment.duration.toFixed(1)} 秒，超过 H3 单段约 15 秒上限。`, n);
+    if (segment.duration > H3_CAP.sec + 0.1) push("error", "long_segment", `第 ${n} 段 ${segment.duration.toFixed(1)} 秒，超过 H3 单段约 ${H3_CAP.sec} 秒上限。`, n);
     if (!segment.duration) push("warn", "unknown_duration", `第 ${n} 段没有可识别时长，请手动确认。`, n);
 
     /* 官方长时间轴拆段后，提示词可能仍保留全片时间/风格契约作为身份与阶段说明。

@@ -25,6 +25,7 @@ import os
 import glob
 import json
 import re
+import time
 import asyncio
 import platform
 import sys
@@ -53,7 +54,7 @@ from .media_utils import (
 OUTPUT_DIR = folder_paths.get_output_directory()
 VIDEO_DIR = os.path.join(OUTPUT_DIR, "video")
 PROJECT_ROOT = os.path.join(VIDEO_DIR, "h3director")
-BACKEND_VERSION = "2.40.2"  # 前端 JS 据此判断后端代码是否过旧（提示用户重启 ComfyUI）
+BACKEND_VERSION = "2.40.5"  # 前端 JS 据此判断后端代码是否过旧（提示用户重启 ComfyUI）
 MAX_AUDIO_UPLOAD = 100 * 1024 * 1024
 MAX_VIDEO_UPLOAD = 2 * 1024 * 1024 * 1024
 MAX_SUBTITLE_UPLOAD = 10 * 1024 * 1024
@@ -848,6 +849,63 @@ def _safe_project_id(value):
 
 def _project_dir(value):
     return os.path.join(PROJECT_ROOT, _safe_project_id(value))
+
+
+# 「段1 起始帧取自插入视频」这个联动的调用痕迹。
+# 用途：抽帧结果按内容哈希去重，若插入的视频末帧原本就抽过，磁盘上不会留下任何新文件，
+# 于是"前端到底有没有调用接口"在文件系统上无法判断。这里在内存里留一份可查询痕迹，
+# 通过 GET /h3director/seg1_start_trace 读取，用于排查前端缓存/未刷新之类的问题。
+_SEG1_START_TRACE = []
+_SEG1_START_TRACE_MAX = 20
+
+
+def _record_seg1_start_trace(project_id, clip, frame="", error=""):
+    _SEG1_START_TRACE.append({
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "project_id": project_id,
+        "clip": clip,
+        "frame": frame,
+        "error": error,
+    })
+    del _SEG1_START_TRACE[:-_SEG1_START_TRACE_MAX]
+
+
+def _save_input_start_frame(frame, prefix="h3seg1start_"):
+    """段1 专用：把视频末帧作为 FL2VA 硬首帧存进 input 目录，返回 ComfyUI 可解析的文件名。
+
+    段1 没有"上一段"，所以它的"续接"语义等价于自定义首帧（first_frame_mode="custom"），
+    存进 input 目录后由 studio_node 既有的 _load_input_image(custom_first_frame) 分支消费，
+    不需要改动段间隔接逻辑。文件名取内容哈希，重复抽同一末帧不会堆积垃圾文件。
+    """
+    import numpy as np
+    from PIL import Image
+
+    arr = np.asarray(frame)
+    if arr.ndim != 3 or arr.shape[-1] < 3:
+        raise ValueError("续接帧必须是 [H,W,3]")
+    arr = np.clip(arr[..., :3], 0, 255).astype(np.uint8, copy=False)
+    input_dir = folder_paths.get_input_directory()
+    os.makedirs(input_dir, exist_ok=True)
+    digest = hashlib.md5(np.ascontiguousarray(arr).tobytes()).hexdigest()[:12]
+    path = os.path.join(input_dir, "%s%s.png" % (prefix, digest))
+    if os.path.exists(path):
+        # 文件名即内容哈希：同名即同内容。直接复用，不碰 mtime——段缓存哈希包含
+        # _input_signature 的 mtime_ns，无谓重写会让段1 每次都判定为"配置已变"而白跑。
+        return os.path.basename(path)
+    temp_path = None
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix=prefix, suffix=".png", dir=input_dir)
+        os.close(fd)
+        Image.fromarray(arr, "RGB").save(temp_path, format="PNG")
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+    return os.path.basename(path)
 
 
 def _post_asset_path(project_id, mode, kind, name):
@@ -2839,6 +2897,66 @@ def register_routes():
         except OSError as error:
             return web.json_response({"error": "删除插入视频失败：%s" % error}, status=500)
         return web.json_response({"ok": True, "name": os.path.basename(path)})
+
+    @app.routes.post("/h3director/timeline_start_frame")
+    async def timeline_start_frame(request):
+        """取「镜头时间轴」里插在段1 前面那个视频的末帧，作为段1 的起始帧。
+
+        只读项目目录里已经存在的 _h3_timeline_*.mp4，不需要前端重新上传一次；
+        抽帧复用「从视频续接」同一套质量检查（扫描末尾若干帧，坏帧自动回退）。
+        """
+        try:
+            data = await request.post()
+        except (TypeError, ValueError):
+            return web.json_response({"error": "请求体不是有效的表单"}, status=400)
+        try:
+            path = _timeline_video_path(data.get("project_id"), data.get("name"))
+        except ValueError as error:
+            _record_seg1_start_trace(_safe_project_id(data.get("project_id")),
+                                     str(data.get("name") or ""), error=str(error))
+            return web.json_response({"error": str(error)}, status=400)
+        if not os.path.isfile(path):
+            _record_seg1_start_trace(_safe_project_id(data.get("project_id")),
+                                     os.path.basename(path), error="插入视频不存在")
+            return web.json_response({"error": "插入视频不存在"}, status=404)
+        _record_seg1_start_trace(_safe_project_id(data.get("project_id")), os.path.basename(path))
+        try:
+            frame, info = await asyncio.to_thread(extract_clean_tail_frame, path)
+        except Exception as error:
+            return web.json_response({"error": "读取插入视频失败：%s" % error}, status=422)
+        if frame is None:
+            message = (info or {}).get("reason") or "视频尾部没有可用于起始帧的正常帧"
+            details = []
+            for item in ((info or {}).get("rejected") or [])[:2]:
+                details.extend((item.get("reasons") or [])[:1])
+            if details:
+                message += "（%s）" % "；".join(details)
+            return web.json_response({"error": message}, status=422)
+        try:
+            name = await asyncio.to_thread(_save_input_start_frame, frame)
+        except Exception as error:
+            return web.json_response({"error": "起始帧存盘失败：%s" % error}, status=500)
+        _record_seg1_start_trace(_safe_project_id(data.get("project_id")),
+                                 os.path.basename(path), frame=name)
+        return web.json_response({
+            "ok": True,
+            "first_frame": name,
+            "selected_frame": int((info or {}).get("selected_index", 0)) + 1,
+            "total_frames": int((info or {}).get("total_frames") or 0),
+            "fallback_frames": int((info or {}).get("fallback_frames") or 0),
+        })
+
+    @app.routes.get("/h3director/seg1_start_trace")
+    async def seg1_start_trace(request):
+        """诊断用：返回「段1 起始帧取自插入视频」联动的最近调用痕迹。
+
+        抽帧结果按内容哈希去重，插入同一个视频时不产生新文件，磁盘因此无法判断
+        前端有没有真的调用接口。这里给出内存中的调用记录，用于排查前端缓存问题。
+        """
+        return web.json_response({
+            "count": len(_SEG1_START_TRACE),
+            "calls": list(_SEG1_START_TRACE),
+        })
 
     @app.routes.post("/h3director/reorder_segments")
     async def reorder_segments(request):

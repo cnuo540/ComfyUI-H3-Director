@@ -35,6 +35,12 @@ from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo, MiniMaxH3Im
 from comfy_extras.nodes_audio import vae_decode_audio
 from server import PromptServer
 
+from .face_refine.pack import (
+    ensure_face_refine_ready,
+    face_pack_to_jsonable,
+    face_refine_fingerprint,
+    normalize_face_refine_pack,
+)
 from .media_utils import (
     MERGE_AUDIO_RATE,
     enforce_continuity_start,
@@ -785,6 +791,22 @@ _CROSS_STYLE_CONTINUITY_DIRECTIVE = (
     "identity, geometry and motion continuity; do not recreate the previous 3D/live-action look."
 )
 
+_OPENING_FRAME_CONTINUITY_DIRECTIVE = (
+    "HIGHEST PRIORITY OPENING FRAME CONTRACT: The opening frame is the exact final frame of the source "
+    "video this segment must continue from. For the first 0.33 seconds preserve the same subject identity, "
+    "screen position, pose, motion direction, camera orientation, lighting, scene, visual style and "
+    "unfinished action, so the continuation reads as one uninterrupted shot. Carry the action forward from "
+    "that frame; do not cut away, do not re-establish the scene, and do not restage this opening shot."
+)
+
+_CROSS_STYLE_OPENING_FRAME_CONTINUITY_DIRECTIVE = (
+    "HIGHEST PRIORITY CROSS-STYLE OPENING FRAME CONTRACT: The supplied opening frame is a soft continuity "
+    "reference only. Preserve subject identity, screen position, pose, motion direction, camera orientation "
+    "and unfinished action, but DO NOT preserve the source video's rendering style. The first Shot of this "
+    "segment defines the new target rendering style from its first frame. Use the opening frame only for "
+    "identity, geometry and motion continuity; do not recreate the source 3D/live-action look."
+)
+
 _SOFT_TAIL_QUALITY_DIRECTIVE = (
     "SOFT CONTINUITY QUALITY CONTRACT: The inherited picture is a temporal and geometric anchor, "
     "not a texture-quality ceiling. Render at the current segment's native output resolution with "
@@ -858,26 +880,38 @@ def _sanitize_global_prompt(global_prompt):
 
 
 def _build_continuity_directive(tail_picture_no=None, hard_first_frame=False,
-                                preserve_visual_style=True):
-    base = _CONTINUITY_DIRECTIVE if preserve_visual_style else _CROSS_STYLE_CONTINUITY_DIRECTIVE
+                                preserve_visual_style=True, opening_frame=False):
+    if opening_frame:
+        # 段1 没有"上一段"：基座换成"开场帧"契约，避免灌入"不要重放开场"这类反向指令。
+        base = (_OPENING_FRAME_CONTINUITY_DIRECTIVE if preserve_visual_style
+                else _CROSS_STYLE_OPENING_FRAME_CONTINUITY_DIRECTIVE)
+    else:
+        base = _CONTINUITY_DIRECTIVE if preserve_visual_style else _CROSS_STYLE_CONTINUITY_DIRECTIVE
     if tail_picture_no:
         tag = "<Picture %d>" % int(tail_picture_no)
+        source = ("the exact final frame of the source video this segment must start from"
+                  if opening_frame else
+                  "the exact final frame inherited from the previous segment")
         relation = (
-            "preserve its opening composition, subject placement, pose, camera, lighting, scene and "
-            "visual style before continuing the action."
+            ("preserve its composition, subject placement, pose, camera, lighting, scene and "
+             "visual style, and treat it as the opening frame this segment begins from."
+             if opening_frame else
+             "preserve its opening composition, subject placement, pose, camera, lighting, scene and "
+             "visual style before continuing the action.")
             if preserve_visual_style else
             "preserve subject identity, placement, pose, camera geometry and motion direction, while the "
             "current segment's first Shot supplies the new rendering style."
         )
         return (base
-                + "\nCONTINUITY REFERENCE: %s is the exact final frame inherited from the previous segment; %s" % (tag, relation)
+                + "\nCONTINUITY REFERENCE: %s is %s; %s" % (tag, source, relation)
                 + "\n" + _SOFT_TAIL_QUALITY_DIRECTIVE)
     if hard_first_frame:
         return base + " The supplied FL2VA first-frame keyframe is mandatory."
     return base
 
 
-def _inject_ref2va_tail_reference(local_prompt, tail_picture_no, preserve_visual_style=True):
+def _inject_ref2va_tail_reference(local_prompt, tail_picture_no, preserve_visual_style=True,
+                                  opening_frame=False):
     """把尾帧关系写进既有 Ref2VA 六字段正文，绝不创建重复字段或把 Base 混成 Ref2VA。"""
     text = str(local_prompt or "")
     if not tail_picture_no:
@@ -894,25 +928,36 @@ def _inject_ref2va_tail_reference(local_prompt, tail_picture_no, preserve_visual
 
     tag = "<Picture %d>" % int(tail_picture_no)
     retention = (
-        "%s: reference - preserve its opening composition, subject placement, pose, camera, "
-        "lighting, scene and visual style before continuing the action; keep native-resolution detail "
-        "and stable exposure, and do not inherit compression blur, ringing, banding, chroma loss, "
-        "subtitles, watermarks or player borders." % tag
+        ("%s: reference - preserve its composition, subject placement, pose, camera, lighting, scene "
+         "and visual style as the fixed starting point of this segment; keep native-resolution detail "
+         "and stable exposure, and do not inherit compression blur, ringing, banding, chroma loss, "
+         "subtitles, watermarks or player borders." % tag
+         if opening_frame else
+         "%s: reference - preserve its opening composition, subject placement, pose, camera, "
+         "lighting, scene and visual style before continuing the action; keep native-resolution detail "
+         "and stable exposure, and do not inherit compression blur, ringing, banding, chroma loss, "
+         "subtitles, watermarks or player borders." % tag)
         if preserve_visual_style else
         "%s: reference - preserve subject identity, placement, pose, camera geometry and motion direction; "
         "do not preserve the previous rendering style, because the current segment defines a new style." % tag
     )
     detail = (
-        "Continuity requirement: [Shot 1] must begin from %s without a cut; transition forward only "
-        "after this inherited frame is established. Use it as a geometry and motion anchor rather than "
-        "a quality ceiling: do not cumulatively darken, soften, denoise or distort the subject." % tag
+        ("Opening requirement: [Shot 1] must begin from %s without a cut, and that frame is this "
+         "segment's first frame. Use it as a geometry and motion anchor rather than a quality ceiling: "
+         "do not cumulatively darken, soften, denoise or distort the subject." % tag
+         if opening_frame else
+         "Continuity requirement: [Shot 1] must begin from %s without a cut; transition forward only "
+         "after this inherited frame is established. Use it as a geometry and motion anchor rather than "
+         "a quality ceiling: do not cumulatively darken, soften, denoise or distort the subject." % tag)
         if preserve_visual_style else
         "Cross-style continuity requirement: [Shot 1] uses %s only for identity, composition and motion "
         "continuity; from the first frame it must use the new rendering style explicitly defined by this Shot." % tag
     )
     additions = {
         "subject_definitions": (
-            "%s is the exact final frame inherited from the previous segment." % tag),
+            ("%s is the exact final frame of the source video this segment must start from." % tag)
+            if opening_frame else
+            ("%s is the exact final frame inherited from the previous segment." % tag)),
         "retention_analysis": retention,
         "detailed_description": detail,
     }
@@ -1070,9 +1115,14 @@ def _compose_segment_prompt(global_prompt, local_prompt, use_tail=False, seg_idx
     local_text = str(local_prompt or "").strip()
     if int(total_segments or 1) > 1:
         local_text = _localize_segment_soundscape(local_text).strip()
-    if bool(use_tail) and int(seg_idx) > 1 and tail_picture_no:
+    # 段1 的起始帧（「从视频续接」在 Ref2VA 下的降级形态）语义是"本段从此帧开始"，
+    # 不是"继承上一段尾帧"——段1 没有上一段。只有确实存在该 Picture 时才成立，
+    # 所以未设置起始帧的普通段1（use_tail 默认为 True）不会注入任何续接文案。
+    opening_frame = int(seg_idx) == 1 and bool(tail_picture_no or hard_first_frame)
+    if (bool(use_tail) and int(seg_idx) > 1 and tail_picture_no) or opening_frame:
         local_text = _inject_ref2va_tail_reference(
-            local_text, tail_picture_no, preserve_visual_style=preserve_tail_visual_style).strip()
+            local_text, tail_picture_no, preserve_visual_style=preserve_tail_visual_style,
+            opening_frame=opening_frame).strip()
     conflict = _hard_global_conflict(global_text, local_text) if global_text and local_text else ""
     if conflict:
         _log("[H3导演台] 段%d 检测到全局/本段%s冲突，已仅对本段跳过冲突全局提示词" % (seg_idx, conflict))
@@ -1096,10 +1146,10 @@ def _compose_segment_prompt(global_prompt, local_prompt, use_tail=False, seg_idx
             "dialogue, narration, lyrics, broadcasts, whispers, mumbling, vocal syllables, pseudo-language, "
             "or gibberish. Characters keep their mouths closed. Only ambience and visible-action sound effects are allowed."
         )
-    if bool(use_tail) and int(seg_idx) > 1:
+    if (bool(use_tail) and int(seg_idx) > 1) or opening_frame:
         parts.append(_build_continuity_directive(
             tail_picture_no=tail_picture_no, hard_first_frame=hard_first_frame,
-            preserve_visual_style=preserve_tail_visual_style))
+            preserve_visual_style=preserve_tail_visual_style, opening_frame=opening_frame))
     parts.append(_SEGMENT_SCOPE_DIRECTIVE)
     if global_text:
         parts.append(global_text)
@@ -1220,7 +1270,10 @@ def _memory_snapshot():
         vm = psutil.virtual_memory()
         total = int(vm.total)
         available = int(vm.available)
-        reserve = int(min(8 * 1024 ** 3, max(3 * 1024 ** 3, total * 0.18)))
+        # 2026-09-11：下限由 3 GiB 提到 6 GiB。本机 16 GiB 内存时 total*0.18 只有 2.84 GiB，
+        # 原公式的实际安全线就是 3 GiB；第 2 段开始前可用内存 3.05 GiB 恰好没触发深度释放，
+        # 4 个模型全部驻留，随后在解码时因主机内存不足触发 c10.dll 访问违例（0xc0000005）崩溃。
+        reserve = int(min(8 * 1024 ** 3, max(6 * 1024 ** 3, total * 0.18)))
         snapshot.update({
             "ram_total": total,
             "ram_available": available,
@@ -1757,17 +1810,34 @@ def _atomic_write_json(path, payload):
                 pass
 
 
+# 每段生成上限档位：direct() 入口按「每段生成上限」设置；帧数取 H3 的 17k+5 合法网格点
+# （7 秒档：7×24=168 → 最近网格 175=17×10+5，生成 7.29 秒）。
+_CAP_TABLE = {"7秒": (7, 175), "10秒": (10, 243), "15秒": (15, 362)}
+_CAP_SEC = 7
+_CAP_FRAMES = 175
+
+
+def _set_duration_cap(label):
+    global _CAP_SEC, _CAP_FRAMES
+    key = str(label or "").strip()
+    if key not in _CAP_TABLE:
+        key = (key.rstrip("秒") or "7") + "秒"
+    if key not in _CAP_TABLE:
+        key = "7秒"
+    _CAP_SEC, _CAP_FRAMES = _CAP_TABLE[key]
+
+
 def _integer_segment_duration(duration):
     try:
         duration = float(duration)
     except (TypeError, ValueError):
         duration = 10.0
-    return max(2, min(15, math.floor(duration + 0.5)))
+    return max(2, min(_CAP_SEC, math.floor(duration + 0.5)))
 
 
 def _segment_frame_count(duration):
     duration = _integer_segment_duration(duration)
-    requested_frames = max(39, min(362, round(duration * FPS)))
+    requested_frames = max(39, min(_CAP_FRAMES, round(duration * FPS)))
     return min(range(39, 363, 17), key=lambda frames: abs(frames - requested_frames))
 
 
@@ -2669,7 +2739,7 @@ def _load_video_for_ref(path, ffmpeg, seg_cfg=None):
     """读参考视频（白模/成片参考）→ (IMAGE 帧 batch, AUDIO|None)。
 
     H3 原生 ref_videos 契约：IMAGE 帧序列 @24fps、2~15s（帧数由 H3 节点自己
-    对齐 17k+5 网格并截断，这里只需不超 15s、不少于 5 帧）。
+    对齐 17k+5 网格并截断，这里按节点「每段生成上限」当前档位截断、不少于 5 帧）。
     解码走 imageio_ffmpeg read_frames 管道（避开 torchcodec/torchvision 视频 API
     在 Windows 的坑）；最长边预缩到 1280 控内存（H3 内部还会按画布再缩）。
     音轨复用 _load_audio_for_ref 的 PCM 管道（v2.2 起跟随段的裁剪/偏移设置，
@@ -2689,20 +2759,20 @@ def _load_video_for_ref(path, ffmpeg, seg_cfg=None):
     meta = next(gen)
     vw, vh = meta["size"]
     # 预分配 uint8 缓冲，避免 list + np.stack 同时保留两份完整参考视频。
-    source_duration = max(0.0, float(meta.get("duration") or 15.0) - vskip)
-    max_frames = min(24 * 15, max(5, int(source_duration * vfps) + 18))
+    source_duration = max(0.0, float(meta.get("duration") or float(_CAP_SEC)) - vskip)
+    max_frames = min(24 * _CAP_SEC, max(5, int(source_duration * vfps) + 18))
     frame_store = np.empty((max_frames, vh, vw, 3), dtype=np.uint8)
     frame_count = 0
     for buf in gen:
         frame_store[frame_count] = np.frombuffer(buf, np.uint8).reshape(vh, vw, 3)
         frame_count += 1
-        if frame_count >= max_frames:  # H3 参考视频上限 15s
+        if frame_count >= max_frames:  # H3 参考视频上限（当前档位）
             break
     if frame_count < 5:
         raise RuntimeError("参考视频不足 5 帧（H3 要求 ≥0.2s）: " + path)
     # v2.6.1：向上补齐到 H3 的 17k+5 帧网格（重复末帧）。低帧率采样（如教程的
     # 1fps 人物替换）只有 ~10 帧，H3 节点向下截断会砍到 5 帧丢一半信息；
-    # 补齐保持全部关键帧。超 15s 上限时才向下截断。
+    # 补齐保持全部关键帧。超过当前档上限时才向下截断。
     frames = frame_store[:frame_count]
     nf = frame_count
     if nf % 17 != 5:
@@ -3136,6 +3206,44 @@ def _read_segment_preview(seg, mode="create", project_id="default", target_size=
     return torch.from_numpy(frame.astype(np.float32) / 255.0)[None,], total_frames
 
 
+# 2026-09-11：解码出帧后转 uint8 的分块参数。既按帧数限制（24~32 帧一批），
+# 也按单批 float32 字节数封顶，720p 仍走 32 帧，高分辨率会自动缩小批而不抬高峰值。
+_FRAMES_TO_U8_CHUNK_FRAMES = 32
+_FRAMES_TO_U8_CHUNK_BYTES = 512 * 1024 * 1024
+
+
+def _frames_to_uint8(frames, chunk_frames=_FRAMES_TO_U8_CHUNK_FRAMES,
+                     chunk_bytes=_FRAMES_TO_U8_CHUNK_BYTES):
+    """把解码出的浮点帧按帧分块转成 uint8，结果与整块一次性转换逐像素完全一致。
+
+    旧写法 ``frames.float().clamp(0,1).mul(255).round().to(torch.uint8).cpu().numpy()``
+    会在主机内存里同时留下 2~3 份全量 float32 临时张量（192 帧 720p 每份约 2.1 GiB），
+    而 MiniMaxH3VideoVAE 的解码输出本身也在这台机器的 CPU 上（intermediate_device）。
+    可用内存只剩 3 GiB 时主机分配器失败，即表现为 c10.dll 访问违例而不是可捕获的 OOM。
+    分块后峰值降到「一份分块 float32 + 一份 uint8 输出」，不再有全量 float32 副本。
+    """
+    if not torch.is_tensor(frames):
+        return np.asarray(frames, dtype=np.uint8)
+    shape = tuple(frames.shape)
+    if frames.numel() == 0 or frames.dim() == 0:
+        return frames.to(torch.uint8).cpu().numpy() if frames.numel() else np.empty(
+            shape, dtype=np.uint8)
+    total = int(frames.shape[0])
+    per_item = max(1, frames.numel() // max(1, total))
+    by_bytes = max(1, int(chunk_bytes) // (4 * per_item))  # float32 每元素 4 字节
+    step = max(1, min(int(chunk_frames), by_bytes, total))
+    out = np.empty(shape, dtype=np.uint8)
+    for start in range(0, total, step):
+        end = min(start + step, total)
+        # .to(float32) 对已是 float32 的张量是零拷贝视图，随后的 clamp 才是副本，
+        # 因此 mul_/round_ 只改副本，绝不会就地改写 VAE 的输出缓冲。
+        part = frames[start:end].to(torch.float32)
+        part = part.clamp(0, 1).mul_(255).round_().to(torch.uint8).cpu().numpy()
+        out[start:end] = part
+        del part
+    return out
+
+
 class H3DirectorStudio:
     """漫剧导演台·一体节点。segments_json 由节点内时间轴 UI 维护：
     [{"prompt": str, "seed": int, "refs": [input图片文件名...], "duration": float(秒，可省),
@@ -3154,7 +3262,7 @@ class H3DirectorStudio:
                 "audio_vae": ("VAE",),
                 "width": ("INT", {"default": 832, "min": 32, "max": 4096, "step": 32}),
                 "height": ("INT", {"default": 480, "min": 32, "max": 4096, "step": 32}),
-                "时长秒": ("FLOAT", {"default": 10.0, "min": 2.0, "max": 15.0, "step": 1.0}),
+                "时长秒": ("FLOAT", {"default": 8.0, "min": 2.0, "max": 15.0, "step": 1.0}),
                 "steps": ("INT", {"default": 25, "min": 1, "max": 200, "step": 1}),
                 "sampler": (comfy.samplers.SAMPLER_NAMES,),
                 "scheduler": (comfy.samplers.SCHEDULER_NAMES,),
@@ -3174,6 +3282,37 @@ class H3DirectorStudio:
                              {"default": "仅预览帧(推荐)", "hidden": True}),
                 "project_id": ("STRING", {"default": "", "hidden": True}),
                 "text_shared_refs_json": ("STRING", {"default": "[]", "multiline": True, "hidden": True}),
+                # 每段生成上限档位：追加在 required 末尾，保证旧工作流 widgets_values 索引不错位；
+                # 第一项即默认（7 秒），旧工作流缺少该字段时按默认 7 秒执行；
+                # 存有旧值 "8秒" 的工作流经 _set_duration_cap 兜底自动落到 7 秒档。
+                "每段生成上限": (["7秒", "10秒", "15秒"], {"default": "7秒"}),
+                # 脸修前清理显存：追加在 required 末尾——旧工作流 widgets_values 缺此值时
+                # 按默认 False 执行，位置序列化不受影响（同「每段生成上限」的追加方式）。
+                "脸修前清理显存": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "脸修前清理显存：本段解码后、修脸开始前卸载模型并清空 CUDA 缓存。"
+                            "默认关；未接 face_refine 时无效。显存小或解码后立刻 OOM 时勾上，"
+                            "本段修脸会重新加载模型（每段多一次加载）。"
+                        ),
+                    },
+                ),
+            },
+            "optional": {
+                # 可选修脸：连接 MiniMax H3 Director FaceRefine 节点后，在本段最终成片帧上
+                # 做脸部修复（二采开启时在二采之后执行）；不连接 = 不修脸、零执行影响。
+                # 自定义类型是纯连线口，不占 widgets_values 槽位，旧工作流加载零风险。
+                "face_refine": (
+                    "MMX_DIR_FACE_REFINE",
+                    {
+                        "tooltip": (
+                            "可选。接 MiniMax H3 Director FaceRefine 后在最终成片帧修脸"
+                            "（二采开=二采后修，二采关=一采后修）。不连接=不修脸。"
+                        ),
+                    },
+                ),
             },
             "hidden": {
                 "h3_prompt_graph": "PROMPT",
@@ -3235,8 +3374,12 @@ class H3DirectorStudio:
         custom_first_frame, target_last_frame = _segment_keyframe_names(seg_cfg)
         ignored_hard_keyframes = task != "fl2va" and bool(custom_first_frame or target_last_frame)
         if ignored_hard_keyframes:
-            _log("[H3导演台] 提示：段%d设置了官方硬首帧/目标尾帧，当前模型为 Ref2VA；"
-                 "本次忽略硬关键帧并继续生成。" % seg_idx)
+            if custom_first_frame and seg_idx == 1:
+                _log("[H3导演台] 提示：段%d设置了官方硬首帧，当前模型为 Ref2VA；"
+                     "本段起始帧将作为 Picture 软参考使用（硬首帧本身不生效）。" % seg_idx)
+            else:
+                _log("[H3导演台] 提示：段%d设置了官方硬首帧/目标尾帧，当前模型为 Ref2VA；"
+                     "本次忽略硬关键帧并继续生成。" % seg_idx)
 
         # 1) 组装参考图（顺序决定 <Picture N> 编号，1 起始）：
         #    共享参考图(可选继承) -> 上一段尾帧(可选) -> 本段 refs
@@ -3301,6 +3444,22 @@ class H3DirectorStudio:
                     seg_idx, custom_first_frame, e)) from e
             keyframe_mode = "自定义首帧"
             tail_note = " + 自定义首帧"
+        elif custom_first_frame and seg_idx == 1:
+            # Ref2VA 不支持硬首帧：段1 的「从视频续接」起始帧退化为 Picture 软参考，
+            # 与同模型下段2+ 尾帧的处理方式一致。段1 没有"上一段"，因此注入的是
+            # "本段必须从此帧开始"而非"继承上一段尾帧"的文案。
+            try:
+                anchor = Image.open(_resolve_input(custom_first_frame)).convert("RGB")
+            except Exception as e:
+                raise ValueError("[H3导演台] 段%d起始帧加载失败 %s: %s" % (
+                    seg_idx, custom_first_frame, e)) from e
+            requested_image_references += 1
+            next_picture_no = pic_no
+            anchor_arr = np.asarray(anchor).astype(np.float32) / 255.0
+            if _push(torch.from_numpy(anchor_arr)[None,]):
+                tail_picture_no = next_picture_no
+                tail_note = " + 起始帧(Picture %d)" % tail_picture_no
+                keyframe_mode = "起始帧软参考(Ref2VA)"
         if target_last_frame and task == "fl2va":
             try:
                 last_frame_tensor = _load_input_image(target_last_frame)
@@ -3560,6 +3719,7 @@ class H3DirectorStudio:
             "condition_image_reference_blocks": condition_image_reference_blocks,
             "repair_condition_image_reference_blocks": repair_condition_image_reference_blocks,
             "repair_conditioning": repair_conditioning,
+            "condition_prompt": prompt,
             "reference_prompt_mode": reference_prompt_mode,
             "keyframe_mode": keyframe_mode,
             "prepare_condition": conditioning_done - run_started,
@@ -4076,15 +4236,7 @@ class H3DirectorStudio:
         video_decode_done = time.monotonic()
         if frames.dim() == 5:
             frames = frames[0]
-        frames_u8 = (
-            frames.float()
-            .clamp(0, 1)
-            .mul(255)
-            .round()
-            .to(torch.uint8)
-            .cpu()
-            .numpy()
-        )
+        frames_u8 = _frames_to_uint8(frames)
         del frames, video_lat
         frame_transfer_done = time.monotonic()
         audio = (vae_decode_audio(audio_vae, {"samples": samples})
@@ -4106,9 +4258,30 @@ class H3DirectorStudio:
                              if model_audio_required else 0.0),
         }
 
+    def _apply_face_refine(self, seg_idx, seg_cfg, prepared, face_pack,
+                           model, vae, audio_vae, clip, frames_u8):
+        """最终成片帧修脸：uint8 [N,H,W,3] numpy 进出，检测→裁剪→H3重采→贴回。"""
+        from .face_refine.runtime import apply_segment_face_refine
+
+        frames = torch.from_numpy(frames_u8).to(torch.float32).div_(255.0)
+        seed = int(seg_cfg.get("seed", 0))
+        if str(face_pack.get("seed_mode") or "inherit") == "offset":
+            seed = seed + 1 + int(seg_idx)
+        prompt = str(prepared.get("condition_prompt") or seg_cfg.get("prompt") or "")
+        stitched, note = apply_segment_face_refine(
+            frames=frames, pack=face_pack, prompt=prompt,
+            ref_image_size=str(prepared.get("ref_image_size", "match") or "match"),
+            model=model, vae=vae, audio_vae=audio_vae, clip=clip, seed=seed)
+        out_u8 = stitched.clamp(0, 1).mul(255).round().to(torch.uint8).cpu().numpy()
+        del frames, stitched
+        gc.collect()
+        return out_u8, note
+
     def _sample_prepared_segment(self, seg_idx, seg_cfg, model, vae, audio_vae, cond, latent,
                                  prepared, steps, sampler_name, scheduler, mode="create",
                                  project_id="default", prepare_condition_elapsed=None,
+                                 face_pack=None, clip=None,
+                                 clear_vram_before_face=False,
                                  event_display_node=""):
         run_started = time.monotonic()
         width = int(prepared["width"])
@@ -4284,6 +4457,27 @@ class H3DirectorStudio:
 
             frames_u8, audio, audio_samples, decode_timings = self._decode_sampled_latent(
                 samples, vae, audio_vae, model_audio_required)
+            # 修脸挂点（唯一，两条执行路径都经过这里）：此刻 frames = 本段最终成片帧——
+            # 二采关 = 一采解码；二采开 = 二采解码（二采失败回退一采时 = 回退帧）。
+            # 放在写盘之前，后续 _apply_continuity（尾帧桥接）会再以锚帧校正开头。
+            face_refine_report = ""
+            if face_pack:
+                if clip is None:
+                    raise ValueError(
+                        "[H3导演台] 修脸(face_refine)已连接但缺少 clip 条件输入")
+                if clear_vram_before_face:
+                    # 脸修前清理显存（对齐 MiniMax 同名开关 clear_vram_before_face_refine）：
+                    # 解码后、修脸前把模型踢出显存，压低同段峰值；随后 CLIP/UNET 按需重载，
+                    # 本段多一次加载成本。复用段边界同一套深度释放例程。
+                    _cleanup_runtime_resources(deep=True, reason="脸修前清理显存（开关已开启）")
+                face_started = time.monotonic()
+                frames_u8, face_refine_report = self._apply_face_refine(
+                    seg_idx, seg_cfg, prepared, face_pack,
+                    model, vae, audio_vae, clip, frames_u8)
+                if clear_vram_before_face:
+                    face_refine_report = "修脸前已深度释放显存 | " + face_refine_report
+                _log("[H3导演台] 段%d修脸完成：%.1fs | %s" % (
+                    seg_idx, time.monotonic() - face_started, face_refine_report))
             version_label = ""
             if second_sample_config.get("mode") != "off":
                 version_label = "一次采样" if second_sample_error else "二次采样"
@@ -4404,6 +4598,7 @@ class H3DirectorStudio:
             "second_sample_runtime_released": second_diagnostics["runtime_released"],
             "second_sample_failure": second_diagnostics["failure"],
             "second_sample_stages": second_diagnostics["stages"],
+            "face_refine_report": face_refine_report,
             "decode": decode_timings["decode"] + comparison_decode,
             "video_decode": decode_timings["video_decode"],
             "frame_transfer": decode_timings["frame_transfer"],
@@ -4417,7 +4612,8 @@ class H3DirectorStudio:
                       width, height, default_dur, steps, sampler_name, scheduler, ref_image_size, mode="create",
                       global_prompt="", tail_mode="ref2v", unload_per_seg=False, project_id="default",
                       primary_model_kind="unknown", total_segments=1,
-                      preserve_tail_visual_style=True, event_display_node=""):
+                      preserve_tail_visual_style=True, face_pack=None,
+                      clear_vram_before_face=False, event_display_node=""):
         cond, latent, prepared = self._prepare_segment_condition(
             seg_idx, seg_cfg, shared_refs, clip, vae, audio_vae,
             width, height, default_dur, ref_image_size, mode,
@@ -4426,13 +4622,16 @@ class H3DirectorStudio:
         return self._sample_prepared_segment(
             seg_idx, seg_cfg, model, vae, audio_vae, cond, latent, prepared,
             steps, sampler_name, scheduler, mode, project_id,
+            face_pack=face_pack, clip=clip,
+            clear_vram_before_face=clear_vram_before_face,
             event_display_node=event_display_node)
 
     def _expand_cached_reroll(self, seg_idx, seg_cfg, shared_ref_names, width, height,
                               default_dur, steps, sampler_name, scheduler, ref_image_size,
                               mode, global_prompt, tail_mode, project_id, primary_model_kind,
                               total_segments, preserve_tail_visual_style, run_hash, report,
-                              h3_prompt_graph, h3_unique_id):
+                              h3_prompt_graph, h3_unique_id, face_pack=None,
+                              clear_vram_before_face=False):
         links = {name: _upstream_link(h3_prompt_graph, h3_unique_id, name)
                  for name in ("model", "clip", "vae", "audio_vae")}
         if any(link is None for link in links.values()):
@@ -4491,10 +4690,18 @@ class H3DirectorStudio:
             clip=links["clip"], vae=links["vae"], audio_vae=links["audio_vae"],
             condition_json=json.dumps(condition_payload, ensure_ascii=False, sort_keys=True))
         condition.set_override_display_id(str(h3_unique_id))
+        if face_pack:
+            # 修脸参数随采样载荷进重抽节点（条件缓存不含修脸，参数变化不触发 Qwen 重编码）。
+            sample_payload["face_refine"] = face_pack_to_jsonable(face_pack)
+            if clear_vram_before_face:
+                # 只影响运行期显存行为、不改变输出像素 → 不进 run_cfg 哈希，
+                # 缓存命中的段不受开关影响（输出一致，无需重跑）。
+                sample_payload["face_vram_cleanup"] = True
         sample_json = json.dumps(sample_payload, ensure_ascii=False, sort_keys=True)
         sample = graph.node(
             "H3DirectorOfficialSampleCommit", id="sample_%s_%d" % (mode, seg_idx),
             model=links["model"], vae=links["vae"], audio_vae=links["audio_vae"],
+            clip=links["clip"],
             positive=condition.out(0), latent=condition.out(1), prepared=condition.out(2),
             seed=int(seg_cfg.get("seed", 0)), steps=int(steps), sampler_name=sampler_name,
             scheduler=scheduler, sample_json=sample_json)
@@ -4510,10 +4717,21 @@ class H3DirectorStudio:
                vsegments_json="[]", tsegments_json="[]", ui_mode="create",
                global_prompt="", 续接方式="硬首帧FL2VA(不跳帧)", 每段后卸载模型=False,
                汇总输出="仅预览帧(推荐)", project_id="", text_shared_refs_json="[]",
+               每段生成上限="7秒", 脸修前清理显存=False, face_refine=None,
                h3_prompt_graph=None, h3_unique_id=None):
         # v2.3: two independent workspaces; ui_mode selects the dataset,
         # outputs use per-mode file names so the two never overwrite each other.
         # v2.11: 文本界面（text）——纯提示词生成，无参考图/视频/音频，数据与产出同样独立。
+        _set_duration_cap(每段生成上限)   # 当前档位（7/10/15 秒）：决定段时长与帧数上限
+        face_pack = normalize_face_refine_pack(face_refine)
+        if face_pack is not None:
+            # 快速失败：依赖/检测权重问题在排队后立刻报错，而不是整段生成完才炸。
+            ensure_face_refine_ready(face_pack)
+            _log("[H3导演台] 修脸已启用：%s denoise=%.2f steps=%d canvas=%dx%d (%s)" % (
+                face_pack.get("detector"), face_pack.get("denoise"),
+                face_pack.get("steps"), face_pack.get("canvas_width"),
+                face_pack.get("canvas_height"), face_pack.get("canvas_mode")))
+        clear_vram_before_face = bool(脸修前清理显存)
         mode = ui_mode if ui_mode in ("video", "text") else "create"
         effective_global_prompt = _global_prompt_for_mode(mode, global_prompt)
         if mode == "video" and str(global_prompt or "").strip():
@@ -4646,6 +4864,8 @@ class H3DirectorStudio:
                 report.append("FL2VA 单模型继续运行：段%s 的 Ref2VA 参考素材未送入模型。"
                               % ",".join(map(str, ignored_reference_segments)))
         report.append("资源策略：各段顺序生成；正常段间只做轻量清理并复用模型；内存压力、异常/取消或用户请求时，才在当前段安全写盘后深度释放。")
+        if face_pack and clear_vram_before_face:
+            report.append("VRAM: 脸修前清理显存已开启（解码后、修脸前深度释放模型；本段修脸会重新加载模型）。")
         if tail_style_warning:
             report.append("⚠ 续接提示（不阻断生成）：%s" % tail_style_warning)
         if tail_mode == "ref2v":
@@ -4724,6 +4944,9 @@ class H3DirectorStudio:
                 "sampler": sampler, "scheduler": scheduler, "ris": ref_image_size,
                 "ref_model": ref_model_sig,
             }
+            if face_pack:
+                # 修脸参数只在启用时进哈希：未接线的老段缓存指纹保持不变（老缓存不失效）。
+                run_cfg["face_refine"] = face_refine_fingerprint(face_pack)
             h = _config_hash(run_cfg)
             video_path = _seg_video(seg_idx, mode, project_id)
             tail_path = _seg_tail(seg_idx, mode, project_id)
@@ -4761,7 +4984,8 @@ class H3DirectorStudio:
                         steps, sampler, scheduler, ref_image_size, mode,
                         effective_global_prompt, tail_mode, project_id, primary_model_kind,
                         len(segments), preserve_tail_visual_style, h, cached_report,
-                        h3_prompt_graph, h3_unique_id)
+                        h3_prompt_graph, h3_unique_id, face_pack=face_pack,
+                        clear_vram_before_face=clear_vram_before_face)
                     if expansion is not None:
                         return expansion
                 if shared_ref_names and not shared_refs:
@@ -4806,6 +5030,8 @@ class H3DirectorStudio:
                         project_id=project_id, primary_model_kind=primary_model_kind,
                         total_segments=len(segments),
                         preserve_tail_visual_style=preserve_tail_visual_style,
+                        face_pack=face_pack,
+                        clear_vram_before_face=clear_vram_before_face,
                         event_display_node=str(h3_unique_id or ""))
                     tail_path = _matching_segment_tail(video_path, seg_idx, mode, project_id)
                     validation_started = time.monotonic()
@@ -4908,6 +5134,9 @@ class H3DirectorStudio:
                             os.path.basename(segment_diagnostics["second_sample_current"]),
                             segment_diagnostics["second_sample_comparison_decode"],
                             segment_diagnostics["second_sample_comparison_encode"]))
+                if segment_diagnostics.get("face_refine_report"):
+                    report.append("段%d修脸: %s" % (
+                        seg_idx, segment_diagnostics["face_refine_report"]))
                 report.append(
                     "段%d参考图片: 请求%d张 | 成功加载%d张 | 条件图像块%d个 | %s" % (
                         seg_idx, segment_diagnostics["requested_image_references"],
@@ -4993,6 +5222,9 @@ class H3DirectorOfficialSampleCommit:
             "sampler_name": (comfy.samplers.SAMPLER_NAMES,),
             "scheduler": (comfy.samplers.SCHEDULER_NAMES,),
             "sample_json": ("STRING", {"default": "", "multiline": True}),
+        }, "optional": {
+            # 修脸条件编码用；face_refine 接线时由展开图自动连入。可选=旧图安全。
+            "clip": ("CLIP",),
         }}
 
     RETURN_TYPES = ("IMAGE", "AUDIO", "INT", "INT", "STRING")
@@ -5000,13 +5232,13 @@ class H3DirectorOfficialSampleCommit:
     CATEGORY = "H3导演台/内部"
 
     def sample_commit(self, model, vae, audio_vae, positive, latent, prepared,
-                      seed, steps, sampler_name, scheduler, sample_json):
+                      seed, steps, sampler_name, scheduler, sample_json, clip=None):
         return self._commit_prepared(
             model, vae, audio_vae, positive, latent, prepared,
-            seed, steps, sampler_name, scheduler, sample_json)
+            seed, steps, sampler_name, scheduler, sample_json, clip=clip)
 
     def _commit_prepared(self, model, vae, audio_vae, positive, latent, prepared,
-                         seed, steps, sampler_name, scheduler, sample_json):
+                         seed, steps, sampler_name, scheduler, sample_json, clip=None):
         payload = json.loads(sample_json)
         seg_cfg = dict(payload["segment"])
         seg_cfg["seed"] = int(seed)
@@ -5046,10 +5278,13 @@ class H3DirectorOfficialSampleCommit:
             _atomic_write_json(meta_path, pending_meta)
 
             studio = H3DirectorStudio()
+            face_pack = normalize_face_refine_pack(payload.get("face_refine"))
             video_path, _audio_samples, diagnostics = studio._sample_prepared_segment(
                 seg_idx, seg_cfg, model, vae, audio_vae, positive, latent, prepared,
                 int(steps), sampler_name, scheduler, mode, project_id,
                 prepare_condition_elapsed=0.0,
+                face_pack=face_pack, clip=clip,
+                clear_vram_before_face=bool(payload.get("face_vram_cleanup")),
                 event_display_node=str(payload.get("display_node") or ""))
             tail_path = _matching_segment_tail(video_path, seg_idx, mode, project_id)
             validation_started = time.monotonic()
@@ -5138,6 +5373,9 @@ class H3DirectorOfficialSampleCommit:
                     os.path.basename(diagnostics["second_sample_current"]),
                     diagnostics["second_sample_comparison_decode"],
                     diagnostics["second_sample_comparison_encode"]))
+        if diagnostics.get("face_refine_report"):
+            report.append("段%d修脸: %s" % (
+                seg_idx, diagnostics["face_refine_report"]))
         report.append(
             "段%d参考图片: 请求%d张 | 成功加载%d张 | 条件图像块%d个 | %s" % (
                 seg_idx, diagnostics["requested_image_references"],

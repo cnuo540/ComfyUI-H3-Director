@@ -51,6 +51,7 @@ import {
   toggleH3SegmentSecondSample,
 } from "./h3_second_sample.js";
 import { H3_TEXT_TEMPLATES } from "./h3_templates.js";
+import { H3_CAP, setH3Cap } from "./h3_cap.js";
 import {
   addH3Project,
   backupH3Project,
@@ -124,7 +125,7 @@ import {
 
 /* 前端版本号：与 routes.py 的 BACKEND_VERSION 对应。
    status 接口返回的后端版本若与此不一致（用户改了代码但没重启/没强刷），状态栏红字提示。 */
-const H3S_VERSION = "2.40.2";
+const H3S_VERSION = "2.40.5";
 const activeProjectIds = new Map();
 
 /* “镜头”栏目只回答摄影机怎样运动。景别、构图、人物/手部特写、材质证明等
@@ -348,7 +349,7 @@ const H3_PROMPT_ASSIST_CATALOG = Object.freeze({
 });
 
 /* “逐步填写”完全在本地工作。基础条件、模板专属故事节拍和镜头调度逐项选择后，
-   再按总时长生成不超过 15 秒的 Director 内容段，并在每段内部写出带时间、职责、
+   再按总时长生成不超过当前档上限的 Director 内容段，并在每段内部写出带时间、职责、
    景别、摄影机触发、结果和衔接的镜头表；不依赖 AI 编写剧本。 */
 const H3_GUIDED_PROMPT_STEPS = Object.freeze([
   { key: "content", label: "内容", title: "这条视频主要讲什么？", required: true,
@@ -614,7 +615,7 @@ const H3_GUIDED_PROMPT_STEPS = Object.freeze([
     placeholder: "例如 hi-hat=微震；snare=硬切/放大；808=压屏；vocal重音=文字砸入",
     multiple: true,
     options: ["hi-hat roll=微震/跳帧", "snare=放大/肩膀下压/硬切", "808 bass hit=低频压屏/拉伸/错位", "vocal重音=文字砸入或展开"] },
-  { key: "stitch_policy", label: "衔接协议", title: "超过15秒时的首尾帧、硬切和音频连续规则",
+  { key: "stitch_policy", label: "衔接协议", get title() { return `超过${H3_CAP.sec}秒时的首尾帧、硬切和音频连续规则`; },
     onlyTemplates: ["music_video_subtitle_official"],
     placeholder: "例如 同场景用上一镜尾帧续接；换场用同向Pan；切点只落在句间停顿或snare",
     multiple: true,
@@ -2704,7 +2705,7 @@ function bindCreatePromptDirectToAssets(prompt, assets, hasTailPicture) {
 }
 
 /* MiniMax H3 官方带字段模板：Base（三字段）与 Ref2VA（六字段）。
-   字段结构必须完整保留；超过单次生成上限时，只切分镜头正文并为每段重建完整模板。 */
+   字段结构必须完整保留；超过每段生成上限时，只切分镜头正文并为每段重建完整模板。 */
 function parseStructuredOfficialScript(text) {
   let t = String(text || "").replace(/^\uFEFF/, "");
   t = t.replace(/^[ \t]*\x60{3}(?:text|txt|markdown)?[ \t]*$/gim, "").trim();
@@ -2978,7 +2979,7 @@ function parseStructuredOfficialScript(text) {
 
   let globalStyle = "";
 
-  const MAXGEN = 362 / 24;
+  const MAXGEN = H3_CAP.maxgen;
   let total = 0;
   const timelineValid = shots.length
     && shots.every((shot) => Number.isFinite(shot.start))
@@ -3061,7 +3062,7 @@ function parseStructuredOfficialScript(text) {
       }
       if (!current.length) currentStart = shot.start;
       current.push(shot);
-      if (shot.dur > MAXGEN) addWarning("存在单个 Shot 超过 15 秒，导入后需要手动拆镜。");
+      if (shot.dur > MAXGEN) addWarning(`存在单个 Shot 超过 ${H3_CAP.sec} 秒，导入后需要手动拆镜。`);
     }
     if (current.length) buckets.push(current);
     return buckets;
@@ -3123,7 +3124,7 @@ function parseStructuredOfficialScript(text) {
   } else if (total <= MAXGEN + 0.001) {
     segs.push({ duration: clampDur(total), prompt: buildPrompt(recon(shots, shots[0].start)) });
   } else {
-    if (instruction) addWarning("关键帧对齐模板超过 15 秒，拆段后请检查各段 Picture 对齐时间");
+    if (instruction) addWarning(`关键帧对齐模板超过 ${H3_CAP.sec} 秒，拆段后请检查各段 Picture 对齐时间`);
     const greedyBuckets = greedyShotBuckets();
     const balanced = selectBalancedShotBuckets(5);
     const shortCount = (items) => items.reduce((count, bucket) => {
@@ -3421,7 +3422,7 @@ function parseOfficialScript(text) {
      所以 ≤15s 的片子不再按 Shot 拆成多段（多次生成易断连），而是合并成「一段=一次生成」，
      段提示词保留 [Shot N] At 结构让 H3 自己卡内部节奏；>15s 才按贪心把连续 Shot 装进 ≤15s 生成桶，
      桶内 Shot 重新相对桶起点计时（每次生成都从 0s 起）。 */
-  const MAXGEN = 362 / 24;   // 15.083s，H3 单次原生上限（VAE 对齐最高档）
+  const MAXGEN = H3_CAP.maxgen;   // 当前档位：7/10/15 秒 = 175/243/362 帧（H3 17k+5 合法网格点）
   const fmtTs = (sec) => {
     const totalMs = Math.max(0, Math.round(sec * 1000));
     const hh = Math.floor(totalMs / 3600000);
@@ -3482,12 +3483,12 @@ function parseOfficialScript(text) {
   return segs;
 }
 
-/* v2.13.9：无时间标记的长文案 → 按"朗读时长"智能分段（每段 8~15 秒，标准语速 4.5 字/秒，
+/* v2.13.9：无时间标记的长文案 → 按"朗读时长"智能分段（每段按当前档上限分配，标准语速 4.5 字/秒，
    与台词时长建议同套估算：CJK 1 字 = 1 单位，拉丁词 = 2.5 单位）。
    断点优先级：段落换行 > 句末标点（。！？；…!.?）> 从句标点（，、：）——优先断在完整
    情节/镜头边界，绝不在句中硬断（仅对无标点超长句按字数兜底硬切）。
    返回 [{duration, prompt}]，duration 已吸附 VAE 档位。 */
-function autoSplitByDuration(text, minDur = 8, maxDur = 15, target = 12) {
+function autoSplitByDuration(text, minDur = H3_CAP.split.min, maxDur = H3_CAP.split.max, target = H3_CAP.split.target) {
   const RATE = 4.5;   // 标准语速（字/秒）
   const durOf = (t) => {
     const cjk = (t.match(/[一-鿿　-〿＀-￦]/g) || []).length;
@@ -3529,7 +3530,7 @@ function autoSplitByDuration(text, minDur = 8, maxDur = 15, target = 12) {
   let cur = [], curDur = 0;
   const flush = () => {
     if (!cur.length) return;
-    segs.push({ duration: clampDur(Math.min(15, Math.max(1.6, curDur))), prompt: cur.join("").trim() });
+    segs.push({ duration: clampDur(Math.min(H3_CAP.clamp, Math.max(1.6, curDur))), prompt: cur.join("").trim() });
     cur = []; curDur = 0;
   };
   for (const u of units) {
@@ -3734,7 +3735,7 @@ function finalizeOrdinarySegments(segments) {
    0. 官方格式：integrated_multimodal_description: [Shot 1] … [Shot 2] At 00:00:03.000, …（整段连写）
    A. 段标记：段1（6秒）：… / 第2段 8s / 镜头3：…（无时间则看正文里的时间轴标签）
    B. 区间标记：[0s-6.6s] … / 0:00-0:06 … / 0至6秒：… / 6.6秒 | …
-   C. 整篇无标记（v2.13.9）：按朗读时长自动分段，每段 8~15 秒，断在句/段边界 */
+   C. 整篇无标记（v2.13.9）：按朗读时长自动分段，每段按当前档上限，断在句/段边界 */
 /* AI 故事输出的“场次”是一个 Director 生成段内部的剧情节拍，不等于多个生成任务。
    有明确目标总时长和连续场次时间时，优先按场次边界装入不超过 H3 原生上限的生成桶；
    场次内部绝不再次拆分，也绝不退回按字符数估算时长。 */
@@ -3792,7 +3793,7 @@ function parseTimedSceneScript(text) {
   if (Math.abs(scenes.at(-1).end - total) > tolerance) {
     return blocked(`最后场次结束于 ${scenes.at(-1).end.toFixed(3)} 秒，与目标 ${total.toFixed(3)} 秒不一致`);
   }
-  const maxGeneration = 362 / 24;
+  const maxGeneration = H3_CAP.maxgen;
   if (scenes.some((scene) => scene.end - scene.start > maxGeneration + tolerance)) {
     return blocked("单个场次超过 H3 单次原生上限；请在真实剧情边界上重新划分场次，不能拆场次内部动作");
   }
@@ -3920,7 +3921,7 @@ function parseInlineChineseStoryboard(text) {
   }
   if (errors.length) return blocked(errors.slice(0, 4).join("；"));
 
-  const maxGeneration = 362 / 24;
+  const maxGeneration = H3_CAP.maxgen;
   if (shots.some((shot) => shot.end - shot.start > maxGeneration + tolerance)) {
     return blocked("单个分镜超过 H3 单次原生上限；请在真实分镜边界上重新划分，不能拆分镜内部动作");
   }
@@ -3971,7 +3972,7 @@ function parseCreateScript(text) {
   if (structuredJson && structuredJson.length) {
     for (const segment of structuredJson) {
       const rawDuration = Number(segment.duration) || 10;
-      segment.duration = clampDur(Math.min(15, Math.max(1.6, rawDuration)));
+      segment.duration = clampDur(Math.min(H3_CAP.clamp, Math.max(1.6, rawDuration)));
     }
     return structuredJson;
   }
@@ -3988,7 +3989,7 @@ function parseScript(text) {
     const archiveSegments = buildH3ArchiveImportSegments(archive);
     for (const segment of archiveSegments) {
       const rawDuration = Number(segment.duration) || 10;
-      segment.duration = clampDur(Math.min(15, Math.max(1.6, rawDuration)));
+      segment.duration = clampDur(Math.min(H3_CAP.clamp, Math.max(1.6, rawDuration)));
     }
     return archiveSegments;
   }
@@ -4065,7 +4066,7 @@ function parseScript(text) {
   for (const s of segs) {
     let d = (s.duration != null && s.duration > 0) ? s.duration : bodyEnd(s.prompt);
     if (!(d > 0)) d = 10;                       // 实在没写时间：默认 10 秒
-    s.duration = clampDur(Math.min(15, Math.max(1.6, d)));
+    s.duration = clampDur(Math.min(H3_CAP.clamp, Math.max(1.6, d)));
     delete s.dur;
   }
 
@@ -4322,7 +4323,7 @@ function createAssetMentionEditor(textarea) {
 function clampDur(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return 10;
-  return Math.max(2, Math.min(15, Math.round(number)));
+  return Math.max(2, Math.min(H3_CAP.clamp, Math.round(number)));
 }
 
 function normalizeSegmentDurations(list) {
@@ -4403,6 +4404,47 @@ function buildAiSys(ctx) {
       : "");
 }
 
+/* 每段生成上限三档的 AI 提示词文案：15 秒档与原版逐字一致，10 秒档按同风格新写，
+   7 秒档为当前实现（自 8 秒档适配，8 条目保留作参考）。节拍按建立/行动/结果/反应四段划分。 */
+const H3_AI_COPY = {
+  15: {
+    timeBoundary: "若用户明确写出前X秒、后X秒、A到B秒、从第X秒开始、白天转夜晚、3D转2D/像素、真人转动画等时间约束，必须在首行之后输出“硬时间与风格约束：”清单，使用“0.000–15.000秒：3D”这种精确范围逐条保留；不得把15秒边界拖到18秒或20秒。",
+    segmentRange: "每个生成段通常5–15秒，绝不能超过15秒；边界必须落在场次或主要动作的自然切点，并确保后续官方分镜能在每个边界开始一个新 Shot。禁止按每句话机械切段，也不要留下少于3秒的孤立尾段。",
+    shotDensity: "每个Shot通常2–6秒；特殊快切也不得低于1.5秒。每15秒只能安排约3–5个主要Shot，最多6个；30秒通常约6–10个Shot。一个Shot只承担一个主要动作，不得把眨眼、按钮闪烁、装备飞入、起步和落地分别拆成亚秒镜头。导演台会在导入时把连续Shot自动装入不超过约15秒的生成段。总时长超过15秒时，请优先把Shot边界安排在可组成约5–15秒生成段的位置；在不影响剧情的前提下，不要留下少于5秒的最后孤立尾段。不要为了满足单次15秒限制删除情节，也不要给每句话额外增加默认时长。\n",
+    hardEdge: "硬时间契约优先级最高：输入剧本的“硬时间与风格约束”必须逐条保留。若边界为15.000秒，则 At 00:00:15.000 对应 Shot 的第一帧必须已经是目标风格，不允许先继续旧风格几秒再在18秒或20秒转换；边界必须正好落在一个 Shot 起点。",
+    beat: "15秒节拍：0–4秒建立主体和异常，4–8秒角色采取一个动作，8–12秒动作得到意外结果，12–15秒完成反应、决定或钩子。",
+    createDensity: "\n\n创作页面电影化分镜规则：默认每15秒安排3–4个 Shot；只有快速动作蒙太奇才允许5个，服从性下降时减为2–3个，禁止用增加镜头数量掩盖动作不具体。",
+  },
+  10: {
+    timeBoundary: "若用户明确写出前X秒、后X秒、A到B秒、从第X秒开始、白天转夜晚、3D转2D/像素、真人转动画等时间约束，必须在首行之后输出“硬时间与风格约束：”清单，使用“0.000–10.000秒：3D”这种精确范围逐条保留；不得把10秒边界拖到12秒或14秒。",
+    segmentRange: "每个生成段通常5–10秒，绝不能超过10秒；边界必须落在场次或主要动作的自然切点，并确保后续官方分镜能在每个边界开始一个新 Shot。禁止按每句话机械切段，也不要留下少于3秒的孤立尾段。",
+    shotDensity: "每个Shot通常2–5秒；特殊快切也不得低于1.4秒。每10秒只能安排约3–4个主要Shot，最多5个；30秒通常约6–10个Shot。一个Shot只承担一个主要动作，不得把眨眼、按钮闪烁、装备飞入、起步和落地分别拆成亚秒镜头。导演台会在导入时把连续Shot自动装入不超过约10秒的生成段。总时长超过10秒时，请优先把Shot边界安排在可组成约5–10秒生成段的位置；在不影响剧情的前提下，不要留下少于4秒的最后孤立尾段。不要为了满足单次10秒限制删除情节，也不要给每句话额外增加默认时长。\n",
+    hardEdge: "硬时间契约优先级最高：输入剧本的“硬时间与风格约束”必须逐条保留。若边界为10.000秒，则 At 00:00:10.000 对应 Shot 的第一帧必须已经是目标风格，不允许先继续旧风格几秒再在12秒或14秒转换；边界必须正好落在一个 Shot 起点。",
+    beat: "10秒节拍：0–3秒建立主体和异常，3–6秒角色采取一个动作，6–8秒动作得到意外结果，8–10秒完成反应、决定或钩子。",
+    createDensity: "\n\n创作页面电影化分镜规则：默认每10秒安排2–4个 Shot；只有快速动作蒙太奇才允许4个，服从性下降时减为2个，禁止用增加镜头数量掩盖动作不具体。",
+  },
+  7: {
+    timeBoundary: "若用户明确写出前X秒、后X秒、A到B秒、从第X秒开始、白天转夜晚、3D转2D/像素、真人转动画等时间约束，必须在首行之后输出“硬时间与风格约束：”清单，使用“0.000–7.000秒：3D”这种精确范围逐条保留；不得把7秒边界拖到8秒或10秒。",
+    segmentRange: "每个生成段通常4–7秒，绝不能超过7秒；边界必须落在场次或主要动作的自然切点，并确保后续官方分镜能在每个边界开始一个新 Shot。禁止按每句话机械切段，也不要留下少于3秒的孤立尾段。",
+    shotDensity: "每个Shot通常1.5–3.5秒；特殊快切也不得低于1.2秒。每7秒只能安排约2–3个主要Shot，最多3个；30秒通常约6–10个Shot。一个Shot只承担一个主要动作，不得把眨眼、按钮闪烁、装备飞入、起步和落地分别拆成亚秒镜头。导演台会在导入时把连续Shot自动装入不超过约7秒的生成段。总时长超过7秒时，请优先把Shot边界安排在可组成约4–7秒生成段的位置；在不影响剧情的前提下，不要留下少于3秒的最后孤立尾段。不要为了满足单次7秒限制删除情节，也不要给每句话额外增加默认时长。\n",
+    hardEdge: "硬时间契约优先级最高：输入剧本的“硬时间与风格约束”必须逐条保留。若边界为7.000秒，则 At 00:00:07.000 对应 Shot 的第一帧必须已经是目标风格，不允许先继续旧风格几秒再在8秒或10秒转换；边界必须正好落在一个 Shot 起点。",
+    beat: "7秒节拍：0–2秒建立主体和异常，2–4秒角色采取一个动作，4–5秒动作得到意外结果，5–7秒完成反应、决定或钩子。",
+    createDensity: "\n\n创作页面电影化分镜规则：默认每7秒安排2–3个 Shot；只有快速动作蒙太奇才允许3个，服从性下降时减为2个，禁止用增加镜头数量掩盖动作不具体。",
+  },
+  8: {
+    timeBoundary: "若用户明确写出前X秒、后X秒、A到B秒、从第X秒开始、白天转夜晚、3D转2D/像素、真人转动画等时间约束，必须在首行之后输出“硬时间与风格约束：”清单，使用“0.000–8.000秒：3D”这种精确范围逐条保留；不得把8秒边界拖到10秒或12秒。",
+    segmentRange: "每个生成段通常4–8秒，绝不能超过8秒；边界必须落在场次或主要动作的自然切点，并确保后续官方分镜能在每个边界开始一个新 Shot。禁止按每句话机械切段，也不要留下少于3秒的孤立尾段。",
+    shotDensity: "每个Shot通常1.5–4秒；特殊快切也不得低于1.2秒。每8秒只能安排约2–3个主要Shot，最多4个；30秒通常约6–10个Shot。一个Shot只承担一个主要动作，不得把眨眼、按钮闪烁、装备飞入、起步和落地分别拆成亚秒镜头。导演台会在导入时把连续Shot自动装入不超过约8秒的生成段。总时长超过8秒时，请优先把Shot边界安排在可组成约4–8秒生成段的位置；在不影响剧情的前提下，不要留下少于3秒的最后孤立尾段。不要为了满足单次8秒限制删除情节，也不要给每句话额外增加默认时长。\n",
+    hardEdge: "硬时间契约优先级最高：输入剧本的“硬时间与风格约束”必须逐条保留。若边界为8.000秒，则 At 00:00:08.000 对应 Shot 的第一帧必须已经是目标风格，不允许先继续旧风格几秒再在10秒或12秒转换；边界必须正好落在一个 Shot 起点。",
+    beat: "8秒节拍：0–2秒建立主体和异常，2–4秒角色采取一个动作，4–6秒动作得到意外结果，6–8秒完成反应、决定或钩子。",
+    createDensity: "\n\n创作页面电影化分镜规则：默认每8秒安排2–3个 Shot；只有快速动作蒙太奇才允许4个，服从性下降时减为2个，禁止用增加镜头数量掩盖动作不具体。",
+  },
+};
+
+function h3AiCopy() {
+  return H3_AI_COPY[H3_CAP.sec] || H3_AI_COPY[7];
+}
+
 function buildStoryToScriptSys(assetContext = "（参考资产库为空）", outputLanguage = "") {
   const languageRule = outputLanguage === "zh-CN"
     ? "只输出简体中文剧本；场次、动作、镜头、环境、声音和配乐描述全部使用简体中文，只有 @资产编号、数字和规定的格式标记保持原样。不要翻译成英文。"
@@ -4414,7 +4456,7 @@ function buildStoryToScriptSys(assetContext = "（参考资产库为空）", out
     + "用户输入中的“画幅、类型、风格、节奏、对白、运镜、重点、镜头结构、转场、声音、配乐、连续性、画面文字、限制”是用户主动选择的创作条件，必须在首行后的“创作要求：”中逐项原样保留并落实到场次，禁止擅自换风格、换画幅、增加对白、使用互斥运镜或忽略禁止项。"
     + "用户选择“无对白无旁白”时，所有场次都不得出现“角色名：台词”、旁白、画外音、内心独白、解说或任何可听语言；只允许△动作描述、真实环境音和非语言同步音效。"
     + "参考提示词案例只用于学习画面组织、动作连续、声音同步和约束写法，不得复制案例中的人物、地点、品牌、对白、UI文案或剧情；不得把案例的【正向】【反向】等中间标题原样输出。"
-    + "若用户明确写出前X秒、后X秒、A到B秒、从第X秒开始、白天转夜晚、3D转2D/像素、真人转动画等时间约束，必须在首行之后输出“硬时间与风格约束：”清单，使用“0.000–15.000秒：3D”这种精确范围逐条保留；不得把15秒边界拖到18秒或20秒。"
+    + h3AiCopy().timeBoundary
     + "严格使用以下场次结构：场次编号、场次起止时间：A.000–B.000秒、场景与时间、出场人物、△场景动作、角色名：台词。所有场次从0秒连续覆盖到X秒，前一场结束必须等于后一场开始，最后一场结束必须严格等于X。"
     + "用户写“快速”时必须压缩为较短场次，不得让快速选择装备等动作占据大半成片。每场写清空间布局、主光源、人物方位和动作因果。"
     + "每个场次通常持续3–6秒；30秒成片通常控制在约6–8个主要场次。禁止把微表情、按钮闪烁、单步移动分别拆成亚秒级场次。"
@@ -4435,7 +4477,7 @@ function buildNovelAnalysisSys(assetContext = "（参考资产库为空）", tar
     + "保留原文人物、地点、道具、对白和因果关系；把心理描写转换为可见动作、表情、光影和空间变化，不得新增原文没有的人物、武器、地点、支线、字幕、Logo或结局。"
     + "先输出“人物分析：”和“场景分析：”，使用简短列表记录完整名称与连续性特征；随后按“场次编号、场次起止时间：A.000–B.000秒、场景与时间、出场人物、△场景动作、角色名：原文台词”输出剧本。所有场次必须从0秒连续覆盖到目标总时长。"
     + "最后必须输出“生成段计划：”和“生成段总数：N”，每段严格使用四行：生成段N、生成段起止时间：A.000–B.000秒、尾帧续接：开启/关闭/待确认、尾帧原因：简短原因。"
-    + "每个生成段通常5–15秒，绝不能超过15秒；边界必须落在场次或主要动作的自然切点，并确保后续官方分镜能在每个边界开始一个新 Shot。禁止按每句话机械切段，也不要留下少于3秒的孤立尾段。"
+    + h3AiCopy().segmentRange
     + "第1段必须写“尾帧续接：关闭”，原因写“首段没有上一段尾帧”。同一人物、同一场景和连续动作通常开启；换地点、时间跳跃、进入或退出回忆、独立新场景、硬风格变化通常关闭；确实无法判断时写待确认。"
     + "对白必须保持原文，不得为了填满时长虚构对白；正常语速按不超过4字/秒安排。镜头数量只在动作结构中合理体现，不要把眨眼、抬手、灯光闪烁分别拆成亚秒镜头。"
     + "\n\n下面是导演台本地参考资产目录。只在小说确实使用对应人物、场景或道具时引用，必须逐字保持完整名称；不要输出文件名、路径或稳定ID。"
@@ -4448,7 +4490,7 @@ function buildOfficialStoryboardSys(assetContext = "（参考资产库为空）"
     + "输出的第一个非空字符必须是 integrated_multimodal_description:；绝不能先写标题、解释、Markdown 或 [Shot 1]。输出顺序和字段必须严格如下，官方三个字段必须先完整出现，director_import_manifest 必须最后出现：\n"
     + "integrated_multimodal_description:\n[Shot 1] ...\n[Shot 2] At 00:00:05.000, ...\n\n"
     + "overall_soundscape:\n...\n\nnon_diegetic_music:\nN/A\n\ndirector_import_manifest:\nformat_version: 2\nsource_total_duration_seconds: X\nduration_policy: preserve\n"
-    + "从输入剧本首行读取“目标总时长：X秒”；如果输入明确写了时长，绝对不能更改。所有 Shot 使用贯穿全片的绝对 HH:MM:SS.mmm 时间戳，不能每15秒重新从0开始。"
+    + `从输入剧本首行读取“目标总时长：X秒”；如果输入明确写了时长，绝对不能更改。所有 Shot 使用贯穿全片的绝对 HH:MM:SS.mmm 时间戳，不能每${H3_CAP.sec}秒重新从0开始。`
     + (chineseOutput
       ? "字段名 integrated_multimodal_description、overall_soundscape、non_diegetic_music、director_import_manifest 以及 [Shot N]、At HH:MM:SS.mmm 必须保持规定的英文格式标记，供导演台解析；除此之外，视觉、动作、镜头、环境、声音和配乐说明全部使用简体中文，不得翻译成英文。对白、歌词和画面中真实可见的文字保持用户原语言与原标点，不得翻译或改写。"
       : "官方三个字段中的视觉、动作、镜头、环境和声音说明使用英文；对白、歌词和画面中真实可见的文字保持用户原语言与原标点，不得翻译或改写。")
@@ -4456,12 +4498,12 @@ function buildOfficialStoryboardSys(assetContext = "（参考资产库为空）"
     + "输入要求无对白无旁白时，禁止输出任何 <d> 标签、says/asks/shouts/voiceover/narration 或可听语言，只保留动作、环境声和非语言音效。"
     + "参考案例只用于学习镜头语法和约束方法，不得复制案例人物、地点、品牌、对白、UI文案或具体剧情，也不得输出【正向】【反向】【整体要求补充】等非官方中间标题。"
     + "[Shot 1] 不写 At；后续每个 Shot 必须写严格递增的绝对 At 时间。最后一个 Shot 的结束点必须正好等于 X 秒，清单中的 source_total_duration_seconds 也必须等于 X。\n"
-    + "每个Shot通常2–6秒；特殊快切也不得低于1.5秒。每15秒只能安排约3–5个主要Shot，最多6个；30秒通常约6–10个Shot。一个Shot只承担一个主要动作，不得把眨眼、按钮闪烁、装备飞入、起步和落地分别拆成亚秒镜头。导演台会在导入时把连续Shot自动装入不超过约15秒的生成段。总时长超过15秒时，请优先把Shot边界安排在可组成约5–15秒生成段的位置；在不影响剧情的前提下，不要留下少于5秒的最后孤立尾段。不要为了满足单次15秒限制删除情节，也不要给每句话额外增加默认时长。\n"
+    + h3AiCopy().shotDensity
     + "在 Shot 1 开头只写全片真正共享的角色身份、外貌、常驻服装、固定道具和通用限制。若后续存在3D→2D/像素、真人→动画等变化，不得写“全片共享电影级3D风格”，也不得把第一场场景、构图、运镜或光照变成全片规则。后续镜头仍使用角色、场景、道具的完整名称，禁止代词、简称、同上、如前、位置不变。\n"
-    + "硬时间契约优先级最高：输入剧本的“硬时间与风格约束”必须逐条保留。若边界为15.000秒，则 At 00:00:15.000 对应 Shot 的第一帧必须已经是目标风格，不允许先继续旧风格几秒再在18秒或20秒转换；边界必须正好落在一个 Shot 起点。"
+    + h3AiCopy().hardEdge
     + (chineseOutput
-      ? "跨约15秒生成段发生硬风格转换时，优先在上一段最后一个 Shot 内完成转换，并用“最终帧：”写清已经是目标风格或中性全屏白光/像素网格；不得输出 Final frame 英文标签。下一段第一 Shot 严格承接该最终帧。若上一段最后帧仍是旧风格，不得假装硬尾帧可以同时满足下一段第一帧立即换风格。\n"
-      : "跨约15秒生成段发生硬风格转换时，优先在上一段最后一个 Shot 内完成转换，并写清 Final frame 已经是目标风格或中性全屏白光/像素网格；下一段第一 Shot 严格承接该最终帧。若上一段最后帧仍是旧风格，不得假装硬尾帧可以同时满足下一段第一帧立即换风格。\n")
+      ? `跨约${H3_CAP.sec}秒生成段发生硬风格转换时，优先在上一段最后一个 Shot 内完成转换，并用“最终帧：”写清已经是目标风格或中性全屏白光/像素网格；不得输出 Final frame 英文标签。下一段第一 Shot 严格承接该最终帧。若上一段最后帧仍是旧风格，不得假装硬尾帧可以同时满足下一段第一帧立即换风格。\n`
+      : `跨约${H3_CAP.sec}秒生成段发生硬风格转换时，优先在上一段最后一个 Shot 内完成转换，并写清 Final frame 已经是目标风格或中性全屏白光/像素网格；下一段第一 Shot 严格承接该最终帧。若上一段最后帧仍是旧风格，不得假装硬尾帧可以同时满足下一段第一帧立即换风格。\n`)
     + "2D像素风必须作用于整个画面的角色、道具、建筑、地面、背景、光影、烟雾和特效；不得只把UI、月亮、眼睛、火花、文字或贴图像素化，同时保留3D角色、真实毛发、PBR材质、体积光或2.5D模型。目标像素阶段每个 Shot 都要明确写“完整原生2D像素风持续保持”。\n"
     + "原生2D像素阶段的运镜只能使用固定侧视/俯视、横向或纵向卷轴、视差背景、Sprite帧动画、画面整体缩放、像素闪白和屏幕震动；禁止环绕角色旋转、360度运镜、低机位空间跟拍、立体通道透视旋转、PBR、体积光、真实毛发和写实景深。\n"
     + "输入剧本对装备、人物、地点或剧情结果只作概括时，按原文组织镜头，不要把缺少具体名称当成错误，也不要替用户新增未写明的装备、人物、敌人、地点或支线。\n"
@@ -4483,7 +4525,7 @@ function buildCreateStoryToScriptSys(assetContext = "（参考资产库为空）
     + "\n\n创作页面脚本框中的用户提示词是本次AI剧情的唯一剧情事实来源。自动分析只决定组织方式，不得替换人物、地点、事件、台词或结局，也不得脱离用户提示词另写故事。"
     + "创作页面电影化编剧规则：同时维护外部任务线、信息推理线、情绪关系线，任何事件都必须由前一个可见原因触发。"
     + "通用因果骨架是目标出现→第一个障碍→角色行动并付出成本→得到线索或局部成功→线索与原判断矛盾→角色验证、选择或误判→真相或威胁揭示→新问题成为下一段钩子。"
-    + "15秒节拍：0–4秒建立主体和异常，4–8秒角色采取一个动作，8–12秒动作得到意外结果，12–15秒完成反应、决定或钩子。"
+    + h3AiCopy().beat
     + "60秒按钩子与目标、尝试与代价、矛盾线索或局部反转、决定与揭示四段推进；180秒按15–45秒一个功能段推进，每45–60秒必须改变目标、风险或认知。"
     + "每场写清进入状态、本场唯一变化和离开状态；对白只保留会改变关系、信息或决定的内容，单句通常控制在2–4秒，能用画面表达的内容不要旁白解释。"
     + "不得擅自改变已绑定角色资产的脸、发型、年龄、体型、帽子、固定服装或标志性配饰；“落魄、疲惫、危险”等剧情状态只能先用表情、姿态、动作、光线和环境表现。只有用户原始提示词明确要求可见换装、伪装、受伤或年龄变化时，才可写出连续发生的外观变化过程。"
@@ -4492,7 +4534,7 @@ function buildCreateStoryToScriptSys(assetContext = "（参考资产库为空）
 
 function buildCreateOfficialStoryboardSys(assetContext = "（参考资产库为空）") {
   return buildOfficialStoryboardSys(assetContext, "zh-CN")
-    + "\n\n创作页面电影化分镜规则：默认每15秒安排3–4个 Shot；只有快速动作蒙太奇才允许5个，服从性下降时减为2–3个，禁止用增加镜头数量掩盖动作不具体。"
+    + h3AiCopy().createDensity
     + "每个 Shot 按摄影与构图→主体→一个主要动作→环境与前中后景→风格、灯光和声音的顺序写；第一句先写真实相机位置、高度、景别或焦段。"
     + "相邻 Shot 至少改变四项：相机侧面、相机高度、景别、焦段、主体位置、前中后景关系、运动方式、遮挡关系。Shot 2以后使用真实 HARD CUT，推拉摇移只属于 Shot 内运动。"
     + "每个 Shot 只有一个主要动作、一个信息变化和一个清晰结束状态；镜头运动只选一个主要路径，优先写希望看到的稳定正向结果，负面限制只保留已经验证的失败模式。"
@@ -4558,7 +4600,7 @@ function extractExplicitStorySegmentContract(value, sourceDuration = 0) {
   if (!perSegmentMatch && !requestedCountMatch && !generationPlan.length) return null;
 
   const tolerance = 0.051;
-  const maxGeneration = 362 / 24;
+  const maxGeneration = H3_CAP.maxgen;
   const requestedDuration = perSegmentMatch ? Number(perSegmentMatch[1]) : 0;
   let requestedCount = requestedCountMatch ? Number(requestedCountMatch[1]) : 0;
   if (generationPlan.length) {
@@ -4665,7 +4707,7 @@ function formatOfficialStoryboardSegmentPrompt(contract) {
 
 /* 已经带 [Shot N] 的输入有时只是按诗句或场景划分的粗时间轴，而不是可直接
    生成的 H3 镜头。把真实粗边界和待补区间明确交给 AI，避免它原样照抄一个
-   20 多秒 Shot，最后在 <=15.083 秒的生成段归一化中丢失剧情时长。 */
+   20 多秒 Shot，最后在 <=8.0 秒的生成段归一化中丢失剧情时长。 */
 function formatCoarseOfficialShotExpansionPrompt(value) {
   const text = String(value || "");
   const marks = [...text.matchAll(/\[Shot\s+(\d+)\s*\]/gi)];
@@ -4716,7 +4758,7 @@ function inspectOfficialStoryboardShotTimeline(value) {
       if (Math.abs(current.start - previous.start) <= 0.001) {
         return `Shot ${current.number} 的 At ${currentTime} 秒与 Shot ${previous.number} 的 ${previousTime} 秒重复；同一边界只能保留一个 Shot 起点`;
       }
-      const resetHint = current.start <= (362 / 24) + 0.001 && previous.start >= (362 / 24) - 0.001
+      const resetHint = current.start <= H3_CAP.maxgen + 0.001 && previous.start >= H3_CAP.maxgen - 0.001
         ? "，疑似在新生成段把绝对时间重新从 0 开始"
         : "";
       return `Shot ${current.number} 的 At ${currentTime} 秒小于 Shot ${previous.number} 的 ${previousTime} 秒，时间发生回退${resetHint}`;
@@ -4986,6 +5028,118 @@ function showAiGenerationResult(element, result, baseText) {
   }
 }
 
+/* ── 每段生成上限档位联动 ─────────────────────────────────────────────
+   切档/加载时把三个页面的段数组统一钳到当前档（决定③：超限自动压），
+   并同步改写权威时长契约，避免后端 _validate_authoritative_duration_contract
+   以“权威源时长与契约组合计不一致”拦截运行；prompt 只改 manifest 头部数字，
+   正文叙事时间轴不改写（由 toast 建议重新“分析导入全部段”）。 */
+function h3CapToast(message) {
+  try {
+    const el = document.createElement("div");
+    el.textContent = message;
+    el.style.cssText = "position:fixed;left:50%;top:64px;transform:translateX(-50%);z-index:10000;"
+      + "background:#12324a;color:#dff3ff;border:1px solid #3d7fb8;border-radius:8px;"
+      + "padding:10px 16px;font-size:13px;line-height:1.6;max-width:680px;white-space:pre-wrap;"
+      + "box-shadow:0 6px 24px rgba(0,0,0,.45);";
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 7000);
+  } catch (error) {
+    console.warn("[H3导演台]", message, error);
+  }
+}
+
+function h3CapRound3(value) {
+  return Math.round(value * 1000) / 1000;
+}
+
+function retargetDurationContracts(segments) {
+  if (!Array.isArray(segments) || !segments.length) return;
+  /* 分组键与后端一致：有契约 ID 按 ID（同 ID 必须同总时长）；
+     无 ID 时后端按 (源总时长, 格式, 策略) 签名分组，这里用原声明总时长对应。 */
+  const groups = new Map();
+  for (const seg of segments) {
+    if (!seg || typeof seg !== "object") continue;
+    const nested = seg.source_contract && typeof seg.source_contract === "object" ? seg.source_contract : null;
+    const declared = [seg.source_total_duration_seconds, seg.source_total_duration,
+      nested && nested.total_duration_seconds, nested && nested.total_duration]
+      .find((value) => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value)));
+    if (declared === undefined) continue;
+    const key = String(seg.source_contract_id || seg.source_duration_contract_id || "")
+      || ("t:" + h3CapRound3(Number(declared)).toFixed(3));
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(seg);
+  }
+  for (const members of groups.values()) {
+    const newTotal = h3CapRound3(members.reduce((sum, seg) => sum + (Number(seg.duration) || 0), 0));
+    if (!(newTotal > 0)) continue;
+    for (const seg of members) {
+      if ("source_total_duration_seconds" in seg) seg.source_total_duration_seconds = newTotal;
+      if ("source_total_duration" in seg) seg.source_total_duration = newTotal;
+      const nested = seg.source_contract;
+      if (nested && typeof nested === "object") {
+        if ("total_duration_seconds" in nested) nested.total_duration_seconds = newTotal;
+        if ("total_duration" in nested) nested.total_duration = newTotal;
+      }
+      if (typeof seg.prompt === "string" && seg.prompt.includes("director_import_manifest:")) {
+        seg.prompt = seg.prompt
+          .replace(/source_total_duration_seconds:\s*[0-9.]+/g,
+            "source_total_duration_seconds: " + newTotal.toFixed(3))
+          .replace(/expected_h3_legal_frames:\s*\d+/g,
+            "expected_h3_legal_frames: " + H3_CAP.frames)
+          .replace(/expected_h3_import_duration_seconds:\s*[0-9.]+/g,
+            "expected_h3_import_duration_seconds: " + (H3_CAP.frames / 24).toFixed(4));
+      }
+    }
+  }
+}
+
+/* 把三个页面（segments/vsegments/tsegments）的段时长全部钳到当前档；
+   返回被压过的段号列表（三个页面合并去重前的原始编号）。 */
+function enforceH3CapOnSegments(node) {
+  const clamped = [];
+  for (const name of ["segments_json", "vsegments_json", "tsegments_json"]) {
+    const widget = (node.widgets || []).find((w) => w.name === name);
+    if (!widget) continue;
+    let list;
+    try { list = JSON.parse(widget.value || "[]"); } catch (error) { continue; }
+    if (!Array.isArray(list) || !list.length) continue;
+    let touched = false;
+    list.forEach((seg, index) => {
+      if (!seg || typeof seg !== "object") return;
+      const raw = Number(seg.duration ?? 10);
+      const next = clampDur(raw);
+      if (next < raw - 0.001) {
+        clamped.push(index + 1);
+        touched = true;
+      }
+      seg.duration = next;
+    });
+    if (touched) {
+      retargetDurationContracts(list);
+      widget.value = JSON.stringify(list);
+    }
+  }
+  return clamped;
+}
+
+function applyH3CapChange(node, label) {
+  setH3Cap(label);
+  const clamped = enforceH3CapOnSegments(node);
+  const durWidget = (node.widgets || []).find((w) => w.name === "时长秒");
+  if (durWidget) {
+    durWidget.options = durWidget.options || {};
+    durWidget.options.max = H3_CAP.clamp;
+    if (Number(durWidget.value) > H3_CAP.clamp) durWidget.value = H3_CAP.clamp;
+  }
+  if (typeof node.__h3Reload === "function") node.__h3Reload();
+  const uniq = [...new Set(clamped)];
+  h3CapToast(`每段生成上限已切到 ${H3_CAP.sec} 秒`
+    + (uniq.length
+      ? `；已自动把第 ${uniq.join("、")} 段压到 ≤${H3_CAP.clamp} 秒（权威时长契约已同步改写）。`
+        + "\n提示词正文中的旧时间轴未改写，建议重新点“分析导入全部段”重建。"
+      : "；当前各段均未超过新上限。"));
+}
+
 function buildStudio(node) {
   if (typeof node.__h3Cleanup === "function") node.__h3Cleanup();
   const jsonWidget = node.widgets.find((w) => w.name === "segments_json");
@@ -4998,10 +5152,36 @@ function buildStudio(node) {
   const unloadWidget = node.widgets.find((w) => w.name === "每段后卸载模型");
   const projectWidget = node.widgets.find((w) => w.name === "project_id");
   const textSharedRefsWidget = node.widgets.find((w) => w.name === "text_shared_refs_json");
+  /* 档位必须先于任何 UI / 校验读取；combo 追加在 required 末尾，旧工作流缺字段时取默认 7 秒；
+     存有旧值 "8秒" 时 setH3Cap 兜底同样落到 7 秒档（与后端 _set_duration_cap 一致）。 */
+  const capWidget = node.widgets.find((w) => w.name === "每段生成上限");
+  if (capWidget) setH3Cap(capWidget.value);
+  const durDefaultWidget = node.widgets.find((w) => w.name === "时长秒");
+  if (durDefaultWidget) {
+    durDefaultWidget.options = durDefaultWidget.options || {};
+    durDefaultWidget.options.max = H3_CAP.clamp;
+    if (Number(durDefaultWidget.value) > H3_CAP.clamp) durDefaultWidget.value = H3_CAP.clamp;
+    /* 显示名改为「时长秒(暂不参考)」：只覆盖 label/localized_name，不改 INPUT 键名
+       （键名=Python 参数名，括号非法），widgets_values 槽位与序列化完全不受影响。 */
+    durDefaultWidget.label = "时长秒(暂不参考)";
+    const durInputSlot = (node.inputs || []).find((inp) => inp && inp.name === "时长秒");
+    if (durInputSlot) durInputSlot.localized_name = "时长秒(暂不参考)";
+    if (typeof node.setDirtyCanvas === "function") node.setDirtyCanvas(true, true);
+  }
+  if (capWidget && !capWidget.__h3CapWired) {
+    capWidget.__h3CapWired = true;
+    const prevCapCallback = capWidget.callback;
+    capWidget.callback = function (value) {
+      const result = prevCapCallback ? prevCapCallback.apply(this, arguments) : undefined;
+      applyH3CapChange(node, value);
+      return result;
+    };
+  }
   if (!jsonWidget) {
     const warn = mk("div", "h3s", "segments_json widget 未找到，导演台初始化失败");
     return warn;
   }
+  enforceH3CapOnSegments(node);   // 加载时按当前档静默钳制（决定③：超限自动压）
   jsonWidget.hidden = true;
   jsonWidget.computeSize = () => [0, -4];
   if (vJsonWidget) { vJsonWidget.hidden = true; vJsonWidget.computeSize = () => [0, -4]; }
@@ -6058,7 +6238,7 @@ function buildStudio(node) {
         const checked = validateH3GuidedDialogueScript(value, {
           mode: inlineGuideSession.fields.dialogue,
           language: inlineGuideSession.fields.dialogue_language,
-          duration: inlineGuideSession.fields.duration || "15秒", segmentSeconds: 15,
+          duration: inlineGuideSession.fields.duration || "15秒", segmentSeconds: H3_CAP.sec,
         });
         if (!checked.ok) {
           status.style.color = "#ffb0a8";
@@ -6138,7 +6318,7 @@ function buildStudio(node) {
         const checked = validateH3GuidedDialogueScript(inlineGuideSession.fields.dialogue_script, {
           mode: inlineGuideSession.fields.dialogue,
           language: inlineGuideSession.fields.dialogue_language,
-          duration: inlineGuideSession.fields.duration || "15秒", segmentSeconds: 15,
+          duration: inlineGuideSession.fields.duration || "15秒", segmentSeconds: H3_CAP.sec,
         });
         if (!checked.ok) {
           status.style.color = "#ffb0a8";
@@ -6323,11 +6503,11 @@ function buildStudio(node) {
       if (!speakers.length && allowCharacters) speakers.push("主角A");
       const validation = validateH3GuidedDialogueScript(guideValues.dialogue_script || "", {
         mode: guideValues.dialogue, language: guideValues.dialogue_language || H3_GUIDED_DIALOGUE_LANGUAGES[0],
-        duration: guideValues.duration || "15秒", segmentSeconds: 15,
+        duration: guideValues.duration || "15秒", segmentSeconds: H3_CAP.sec,
       });
       const editableEntries = parseH3GuidedDialogueEntries(guideValues.dialogue_script || "");
       const dialogue = mk("div", "h3s-one-line-dialogue");
-      dialogue.appendChild(mk("div", "h3s-one-line-title", "多句对白 · 按每15秒Director生成段分组，点击添加不会覆盖已有台词"));
+      dialogue.appendChild(mk("div", "h3s-one-line-title", `多句对白 · 按每${H3_CAP.sec}秒Director生成段分组，点击添加不会覆盖已有台词`));
       const plan = planH3GuidedSegments(guideValues.duration || "15秒");
       for (const segment of plan.segments) {
         const box = mk("div", "h3s-one-line-dialogue-segment");
@@ -6362,7 +6542,7 @@ function buildStudio(node) {
         dialogue.appendChild(box);
       }
       const statusEl = mk("div", `h3s-one-line-dialogue-status${validation.errors.length ? " error" : (validation.warnings.length ? " warn" : "")}`,
-        validation.errors[0] || validation.warnings[0] || (validation.entries.length ? `已填写${validation.entries.length}句；时间、重叠和跨15秒边界检查通过。` : "尚未填写台词。"));
+        validation.errors[0] || validation.warnings[0] || (validation.entries.length ? `已填写${validation.entries.length}句；时间、重叠和跨${H3_CAP.sec}秒边界检查通过。` : "尚未填写台词。"));
       dialogue.appendChild(statusEl);
       oneLineDetailGrid.appendChild(dialogue);
     };
@@ -6800,7 +6980,7 @@ function buildStudio(node) {
         const plan = guidePlan();
         guideProgress.textContent = "完成预览";
         guideTitle.textContent = `本地生成 ${plan.count} 段，共 ${plan.total} 秒`;
-        guideNote.textContent = "这是严格的 H3 官方 Base 三字段和绝对 Shot 时间轴；点“写入并解析导入”会按时长自动拆成不超过15秒的生成段。";
+        guideNote.textContent = `这是严格的 H3 官方 Base 三字段和绝对 Shot 时间轴；点“写入并解析导入”会按时长自动拆成不超过${H3_CAP.sec}秒的生成段。`;
         guidePreview.textContent = buildH3GuidedDirectorScript(guideValues, guideSegments);
         return;
       }
@@ -6843,7 +7023,7 @@ function buildStudio(node) {
       } else if (step.key === "dialogue_language") {
         guideNote.textContent = "普通话会写成官方 <d>[Chinese]准确原文</d>，英文会写成 <d>[English]accurate text</d>；一条视频不要混用语言标签。";
       } else if (step.key === "dialogue_script") {
-        guideNote.textContent = "这里就是输入对话内容的位置。每句单独一行，使用全片绝对时间；台词不能跨越15秒生成段边界，插件会检查格式、重叠和语速。示例：0.000–2.000秒｜熊猫｜我一定要拿到那个红苹果。";
+        guideNote.textContent = `这里就是输入对话内容的位置。每句单独一行，使用全片绝对时间；台词不能跨越${H3_CAP.sec}秒生成段边界，插件会检查格式、重叠和语速。示例：0.000–2.000秒｜熊猫｜我一定要拿到那个红苹果。`;
       } else if (step.key === "voice_direction") {
         guideNote.textContent = "只描述语气、语速和清晰度，不要在这里重复台词；动作音效和BGM会在人声下压低，避免盖住对白。";
       }
@@ -7003,7 +7183,7 @@ function buildStudio(node) {
           mode: guideValues.dialogue,
           language: guideValues.dialogue_language,
           duration: guideValues.duration || "15秒",
-          segmentSeconds: 15,
+          segmentSeconds: H3_CAP.sec,
         });
         if (!checked.ok) {
           guideNote.textContent = checked.errors[0] || "精确台词格式不正确。";
@@ -7232,7 +7412,7 @@ function buildStudio(node) {
       if (isH3GuidedSpeechMode(guideValues.dialogue)) {
         const checked = validateH3GuidedDialogueScript(guideValues.dialogue_script, {
           mode: guideValues.dialogue, language: guideValues.dialogue_language,
-          duration: guideValues.duration || "15秒", segmentSeconds: 15,
+          duration: guideValues.duration || "15秒", segmentSeconds: H3_CAP.sec,
         });
         if (!checked.ok) {
           oneLineDetails.open = true;
@@ -7796,8 +7976,8 @@ function buildStudio(node) {
   const segDur = (s) => clampDur(Number(s.duration ?? 10));
 
   /* 三个页面都允许手动使用 H3 原生可生成的完整整数时长范围。单段不能伪装成
-     超过 362 帧（约 15 秒）；更长内容通过增加段数完成。 */
-  const manualBounds = () => [2, 15];
+     超过当前档帧上限（7/10/15 秒 = 175/243/362 帧）；更长内容通过增加段数完成。 */
+  const manualBounds = () => [2, H3_CAP.clamp];
   const clampManual = (v) => {
     if (isNaN(v)) v = 10;
     const bd = manualBounds();
@@ -10678,6 +10858,86 @@ function buildStudio(node) {
   timelineVideoPicker.multiple = true;
   timelineVideoPicker.style.display = "none";
   box.appendChild(timelineVideoPicker);
+
+  /* 段1 起始帧与「镜头时间轴」插入视频联动：
+     插在段1 前面的那个视频（gap 0，取其中最后一个）的末帧，自动成为段1 的首帧。
+     后端直接从项目目录里已有的 mp4 抽帧，不需要用户再选一次视频。
+     Ref2VA 模型下 studio_node 会把这个首帧降级为 Picture 软参考并注入开场契约。 */
+  const SEG1_START_PREFIX = "h3seg1start_";
+  let seg1StartFrameBusy = false;
+  const timelineClipBeforeSeg1 = () => {
+    const atGap0 = createTimelineVideos.filter((clip) => Number(clip.gap) === 0);
+    return atGap0.length ? atGap0[atGap0.length - 1] : null;
+  };
+  const clearSeg1TimelineStartFrame = () => {
+    const first = createSegs[0];
+    if (!first) return false;
+    const current = typeof first.first_frame === "string" ? first.first_frame : "";
+    if (!current.startsWith(SEG1_START_PREFIX)) return false;
+    first.first_frame = "";
+    if (first.first_frame_mode === "custom") setSegmentPreviousTail(first, false);
+    return true;
+  };
+  const syncSeg1StartFrameFromTimeline = async ({ quiet = false } = {}) => {
+    if (curMode() !== "create" || seg1StartFrameBusy) return;
+    const first = createSegs[0];
+    if (!first) return;
+    const clip = timelineClipBeforeSeg1();
+    if (clip) {
+      // 段1 若已有"手动"设置的首帧，不覆盖；只接管本功能自己生成的那种帧。
+      const current = typeof first.first_frame === "string" ? first.first_frame : "";
+      if (current && !current.startsWith(SEG1_START_PREFIX)) {
+        if (!quiet) {
+          status.style.color = "#e8bd68";
+          status.textContent = "段1 已有手动设置的首帧，未用插入视频覆盖（要替换请先删除该首帧）";
+        }
+        return;
+      }
+    }
+    if (!clip) {
+      if (clearSeg1TimelineStartFrame()) {
+        save();
+        renderTimeline();
+        renderEditor();
+        if (!quiet) {
+          status.style.color = "";
+          status.textContent = "段1 前面已没有插入视频，已清除段1 起始帧";
+        }
+      }
+      return;
+    }
+    seg1StartFrameBusy = true;
+    try {
+      status.style.color = "";
+      status.textContent = "正在用插入视频的末帧设置段1 起始帧…";
+      const data = new FormData();
+      data.append("project_id", ensureProjectId());
+      data.append("name", clip.name);
+      const response = await api.fetchApi("/h3director/timeline_start_frame", { method: "POST", body: data });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || ("HTTP " + response.status));
+      first.first_frame = result.first_frame;
+      first.first_frame_mode = "custom";
+      first.use_tail = false;
+      save();
+      renderTimeline();
+      renderEditor();
+      const fallback = Number(result.fallback_frames || 0);
+      status.style.color = "#8ee6a0";
+      status.textContent = fallback > 0
+        ? `段1 起始帧已就绪（取插入视频末帧，末帧异常已回退 ${fallback} 帧）`
+        : "段1 起始帧已就绪（取插入视频末帧）";
+    } catch (error) {
+      status.style.color = "#ff8080";
+      status.textContent = "段1 起始帧提取失败：" + error.message;
+    } finally {
+      seg1StartFrameBusy = false;
+    }
+  };
+  /* 面板初始化完成后自动对齐一次：刷新页面后不必再重新插一次视频。
+     用 setTimeout 是因为本函数定义在初始化代码之后，且要让整轮同步构建先跑完。 */
+  setTimeout(() => { syncSeg1StartFrameFromTimeline({ quiet: true }); }, 0);
+
   const uploadCreateTimelineVideos = async (files, gap) => {
     let added = 0;
     const errors = [];
@@ -10711,6 +10971,7 @@ function buildStudio(node) {
     status.textContent = added
       ? `已在时间线插入 ${added} 个视频` + (errors.length ? "；" + errors.join("；") : "")
       : (errors.join("；") || "没有可插入的视频");
+    if (added) await syncSeg1StartFrameFromTimeline();
   };
   timelineVideoPicker.addEventListener("change", async () => {
     const files = Array.from(timelineVideoPicker.files || []);
@@ -10733,6 +10994,7 @@ function buildStudio(node) {
     renderTimeline();
     status.style.color = "";
     status.textContent = "已删除时间线插入视频（原始文件不受影响）";
+    await syncSeg1StartFrameFromTimeline();
   };
 
   function updateTotal() {
@@ -10782,6 +11044,7 @@ function buildStudio(node) {
     renderTimeline();
     status.style.color = "";
     status.textContent = "已移动插入视频的位置；最终合成将按当前时间线顺序执行";
+    syncSeg1StartFrameFromTimeline();
   };
   const wireTimelineVideoMoveTarget = (element, gap, beforeName = "") => {
     element.addEventListener("dragover", (event) => {
@@ -10846,6 +11109,7 @@ function buildStudio(node) {
       save();
       status.style.color = "#8ee6a0";
       status.textContent = "已调整段顺序；提示词、参考、音色、尾帧、历史视频和最终合并关系已随段移动";
+      await syncSeg1StartFrameFromTimeline({ quiet: true });
     } catch (error) {
       status.style.color = "#ff8080";
       status.textContent = "移动段失败：" + error.message;
@@ -10874,6 +11138,17 @@ function buildStudio(node) {
       void moveTimelineSegment(sourceSegment, beforeItem);
     });
   };
+
+  /* 段1 起始帧（取自「镜头时间轴」插入视频的末帧）的缩略图 URL。
+     时间线卡片只有 96×64、且 img 铺满整张卡并 overflow:hidden，
+     所以第二个 img 会被裁掉——必须复用卡片自己的缩略图区来显示。 */
+  function seg1StartFramePreviewUrl(segment) {
+    if (!segment) return "";
+    if (segment.first_frame_mode !== "custom") return "";
+    const name = typeof segment.first_frame === "string" ? segment.first_frame.trim() : "";
+    if (!name) return "";
+    return api.apiURL("/view?filename=" + encodeURIComponent(name) + "&type=input");
+  }
 
   function renderTimeline(forceStatus = false) {
     tl.innerHTML = "";
@@ -11104,10 +11379,10 @@ function buildStudio(node) {
         void run(false, [i], "single");
       });
       slot.appendChild(reroll);
-      /* 时长标签可点选——三个页面共用 H3 原生 2~15 秒整数选择器。
+      /* 时长标签可点选——三个页面共用 H3 原生整数秒选择器，上限=当前档（2~clamp）。
          slot 是 overflow:hidden，弹层必须挂 body 用 fixed 定位；点外部自动关闭 */
       const durLab = mk("span", "dur pickable", `${fmtSec(dur)}s`);
-      durLab.title = "点选本段时长（H3 原生范围 2~15 秒；三个页面一致）";
+      durLab.title = `点选本段时长（H3 原生范围 2~${H3_CAP.clamp} 秒；三个页面一致）`;
       durLab.addEventListener("click", (ev) => {
         ev.stopPropagation();
         document.querySelectorAll(".h3s-durpick").forEach((e) => e.remove());
@@ -11253,10 +11528,25 @@ function buildStudio(node) {
           }
           img.hidden = false;
           img.style.display = "";
+          img.title = "本段尾帧";
         } else if (img) {
-          img.hidden = true;
-          img.removeAttribute("src");
-          delete img.dataset.src;
+          /* 段1 还没有成片时，缩略图区改显示它的起始帧（取自段1 前面插入视频的末帧），
+             这样时间线上能直接看到段1 从哪一帧开始。生成出成片后仍以尾帧为准。 */
+          const startSrc = i === 0 ? seg1StartFramePreviewUrl(s) : "";
+          if (startSrc) {
+            if (img.dataset.src !== startSrc) {
+              img.dataset.src = startSrc;
+              img.src = startSrc;
+            }
+            img.hidden = false;
+            img.style.display = "";
+            img.title = "段1 起始帧（取自段1 前面插入视频的末帧）";
+          } else {
+            img.hidden = true;
+            img.removeAttribute("src");
+            delete img.dataset.src;
+            img.title = "";
+          }
         }
       });
       if (st.merged && st.merged.exists) {
@@ -11419,7 +11709,7 @@ function buildStudio(node) {
     din.type = "number";
     din.step = "1";
     din.min = "2";
-    din.max = "15";
+    din.max = String(H3_CAP.clamp);
     din.value = String(segDur(s));
     din.title = "本段时长（整数秒；每段独立；也可在时间轴上拖段块右缘调整）。H3 原生范围 " + manualBounds()[0] + "~" + manualBounds()[1] + "s，三个页面一致";
     din.addEventListener("change", () => {
@@ -13759,6 +14049,9 @@ function buildStudio(node) {
       row.appendChild(badge);
     }
 
+    /* 段1 不再出现这个按钮（原版条件就是 sel >= 1，此处已还原）：
+       段1 的起始帧已由「镜头时间轴」插入视频自动提供，再放一个入口会产出
+       同一个 input 文件、同一个 first_frame 字段，两者会互相覆盖。 */
     if (sel >= 1) {
       const btnCont = mk("button", "h3s-btn", "从视频续接");
       btnCont.title = "上传任意视频，自动检查最后24帧；末帧花屏、黑白坏帧或异常噪点时会回退 N-1、N-2…作为本段续接起点";
@@ -13769,6 +14062,14 @@ function buildStudio(node) {
         inp.style.display = "none";
         // detached input 的 click() 在部分浏览器/内核不弹文件对话框，必须先挂到 DOM
         document.body.appendChild(inp);
+        // 点一下必须有可见反馈：否则无法区分"弹窗没出来"、"自己取消了"和"后端没响应"
+        status.style.color = "";
+        status.textContent = `请在弹出的文件窗口中选择视频（段${sel + 1} 续接帧）…`;
+        inp.addEventListener("cancel", () => {
+          status.style.color = "#e8bd68";
+          status.textContent = `已取消：段${sel + 1} 未选择视频`;
+          inp.remove();
+        });
         inp.addEventListener("change", async () => {
           try {
             if (!inp.files[0]) return;

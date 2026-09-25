@@ -2,6 +2,8 @@
    每套模板只收集会真正改变画面的事实，并自动编译为官方 Base 三字段时间轴；
    模板之间的字段、候选、节拍和镜头职责保持隔离，用户仍可逐项修改。 */
 
+import { H3_CAP } from "./h3_cap.js";
+
 export const H3_GUIDED_TEMPLATE_PHASE_KEYS = Object.freeze([
   "scene_time", "start_state", "positions", "objective", "obstacle", "action",
   "framing", "camera", "lighting", "sound", "end_state",
@@ -3402,7 +3404,7 @@ export function applyH3GuidedTemplate(templateId, currentFields = {}) {
       fields.failure_result = `${protagonist}退回障碍前的安全位置，双手抱住完好的${coreProp}，身体仍朝向${destination}；障碍完整挡住主路，${receiver}仍未进入近景`;
     }
     if (!String(fields.recovery_action || "").trim()) {
-      fields.recovery_action = templateDuration(fields.duration) <= 15
+      fields.recovery_action = templateDuration(fields.duration) <= H3_CAP.sec
         ? `${protagonist}在失败姿态原地停稳→低头检查${coreProp}完好→抬眼比较障碍和路线→把${coreProp}改为双手贴胸固定→调整脚步与重心，立即执行新方案`
         : `${protagonist}从上一段尾帧原地停稳→低头检查${coreProp}完好→抬眼比较障碍和路线→把${coreProp}改为双手贴胸固定→调整脚步与重心，准备执行新方案`;
     }
@@ -3447,7 +3449,7 @@ export function applyH3GuidedTemplate(templateId, currentFields = {}) {
   }
   if (selected.forceAspect) fields.aspect = selected.forceAspect;
   const total = templateDuration(fields.duration);
-  const count = Math.max(1, Math.ceil(total / 15));
+  const count = Math.max(1, Math.ceil(total / H3_CAP.sec));
   const segments = [];
   const templatePhases = selected.id === "minimalist_product_ad_official"
     ? h3GuidedOfficialProductPilotPhases(selected, fields)

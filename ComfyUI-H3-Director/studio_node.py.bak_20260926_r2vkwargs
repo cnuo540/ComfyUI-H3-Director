@@ -3665,15 +3665,10 @@ class H3DirectorStudio:
                 return MiniMaxH3ImageToVideo.execute(
                     clip, vae, condition_prompt, condition_width, condition_height, length,
                     first_frame=first_frame_tensor, last_frame=last_frame_tensor)
-            # 官方 execute() 签名已改为 (clip, prompt, width, height, length,
-            # ref_image_size, vae, audio_vae, ...)，位置传参会让第6个实参占掉
-            # ref_image_size，与后面的关键字冲突 -> got multiple values。全关键字。
             return MiniMaxH3ReferenceToVideo.execute(
-                clip=clip, vae=vae, audio_vae=audio_vae,
-                prompt=condition_prompt, width=condition_width, height=condition_height,
-                length=length, ref_image_size=ref_image_size, ref_images=ref_images,
-                ref_audios=ref_audios, ref_videos=ref_videos,
-                ref_video_audios=ref_video_audios)
+                clip, vae, audio_vae, condition_prompt, condition_width, condition_height, length,
+                ref_image_size=ref_image_size, ref_images=ref_images, ref_audios=ref_audios,
+                ref_videos=ref_videos, ref_video_audios=ref_video_audios)
 
         if task == "fl2va":
             reference_prompt_mode = "fl2va"

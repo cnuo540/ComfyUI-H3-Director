@@ -104,12 +104,9 @@ def apply_segment_face_refine(
     face_prompt = _clean_face_prompt(prompt) or _FALLBACK_PROMPT
 
     # 与主流程同一官方条件入口；不带参考素材（裁剪 latent 已是外观来源）。
-    # 官方 execute() 签名已改为 (clip, prompt, width, height, length,
-    # ref_image_size, vae, audio_vae, ...)，位置传参会让第6个实参占掉
-    # ref_image_size，与后面的关键字冲突 -> got multiple values。全关键字。
     out = MiniMaxH3ReferenceToVideo.execute(
-        clip=clip, vae=vae, audio_vae=audio_vae, prompt=face_prompt,
-        width=int(canvas_w), height=int(canvas_h), length=int(gen_len),
+        clip, vae, audio_vae, face_prompt,
+        int(canvas_w), int(canvas_h), int(gen_len),
         ref_image_size=str(ref_image_size or "match"),
         ref_images=None, ref_audios=None, ref_videos=None, ref_video_audios=None)
     res = out.result

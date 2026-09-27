@@ -1,5 +1,6 @@
 [README.md](https://github.com/user-attachments/files/32543748/README.md)
 # H3 漫剧导演台（ComfyUI-H3-Director）
+![Uploading 360截图20260927231222477.jpg…]()
 
 这是一个面向 ComfyUI 原生 MiniMax H3 工作流的中文长视频导演台。它把"多段生成、逐段验收"的漫剧制作流程整合进**一个节点**：可视化时间轴、每段独立提示词与参考图、每段配音音频、点段预览、单段重抽，段间通过尾帧文件自动接力，并按当前最新分段自动合并成片。
 

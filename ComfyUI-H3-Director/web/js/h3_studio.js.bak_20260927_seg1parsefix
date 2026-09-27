@@ -10879,11 +10879,9 @@ function buildStudio(node) {
     return true;
   };
   const syncSeg1StartFrameFromTimeline = async ({ quiet = false } = {}) => {
-    /* 返回一句"结论"供调用方拼进它自己的状态行；quiet=true 时不抢状态栏。
-       导入脚本这类调用方随后会用更长的提示覆盖本行，所以结论必须靠返回值传递。 */
-    if (curMode() !== "create" || seg1StartFrameBusy) return "";
+    if (curMode() !== "create" || seg1StartFrameBusy) return;
     const first = createSegs[0];
-    if (!first) return "";
+    if (!first) return;
     const clip = timelineClipBeforeSeg1();
     if (clip) {
       // 段1 若已有"手动"设置的首帧，不覆盖；只接管本功能自己生成的那种帧。
@@ -10893,12 +10891,11 @@ function buildStudio(node) {
           status.style.color = "#e8bd68";
           status.textContent = "段1 已有手动设置的首帧，未用插入视频覆盖（要替换请先删除该首帧）";
         }
-        return "段1 已有手动首帧，未用插入视频覆盖";
+        return;
       }
     }
     if (!clip) {
-      const cleared = clearSeg1TimelineStartFrame();
-      if (cleared) {
+      if (clearSeg1TimelineStartFrame()) {
         save();
         renderTimeline();
         renderEditor();
@@ -10907,14 +10904,12 @@ function buildStudio(node) {
           status.textContent = "段1 前面已没有插入视频，已清除段1 起始帧";
         }
       }
-      return cleared ? "段1 起始帧已清除（前面已无插入视频）" : "";
+      return;
     }
     seg1StartFrameBusy = true;
     try {
-      if (!quiet) {
-        status.style.color = "";
-        status.textContent = "正在用插入视频的末帧设置段1 起始帧…";
-      }
+      status.style.color = "";
+      status.textContent = "正在用插入视频的末帧设置段1 起始帧…";
       const data = new FormData();
       data.append("project_id", ensureProjectId());
       data.append("name", clip.name);
@@ -10928,19 +10923,13 @@ function buildStudio(node) {
       renderTimeline();
       renderEditor();
       const fallback = Number(result.fallback_frames || 0);
-      if (!quiet) {
-        status.style.color = "#8ee6a0";
-        status.textContent = fallback > 0
-          ? `段1 起始帧已就绪（取插入视频末帧，末帧异常已回退 ${fallback} 帧）`
-          : "段1 起始帧已就绪（取插入视频末帧）";
-      }
-      return fallback > 0
-        ? `段1 起始帧已同步恢复（末帧异常已回退 ${fallback} 帧）`
-        : "段1 起始帧已同步恢复";
+      status.style.color = "#8ee6a0";
+      status.textContent = fallback > 0
+        ? `段1 起始帧已就绪（取插入视频末帧，末帧异常已回退 ${fallback} 帧）`
+        : "段1 起始帧已就绪（取插入视频末帧）";
     } catch (error) {
       status.style.color = "#ff8080";
       status.textContent = "段1 起始帧提取失败：" + error.message;
-      return "⚠ 段1 起始帧同步失败：" + error.message;
     } finally {
       seg1StartFrameBusy = false;
     }
@@ -13821,14 +13810,6 @@ function buildStudio(node) {
       scheduleSave();
       renderTimeline();
       renderEditor();
-      /* 导入脚本会用 makeImportedCreateSeg 重建段对象，其中的
-         setSegmentPreviousTail(out, position > 0 && …) 对段1（position 0）恒为 false，
-         会把段1 的 first_frame_mode 规范化成 "none"，从而让「镜头时间轴」插入视频
-         提供的起始帧失去作用（缩略图消失、生成时不再作为 Picture 参与）。
-         此时 first_frame 文件名仍在，重新跑一次同步即可把 mode 恢复成 "custom"。
-         放在状态消息构造之前，并通过返回值把结论接到下面的导入结果提示里
-         （本函数自己写的状态行会被导入提示覆盖，所以结论必须走返回值）。 */
-      const seg1Note = await syncSeg1StartFrameFromTimeline({ quiet: true });
       const parsedType = parsed.officialLabel ? "（" + parsed.officialLabel + "）" : "";
       const mediaNote = hadMedia ? "；原有同序手动参考、配音和音色已保留" : "";
       const assignedCount = targetIndexes.reduce(
@@ -13850,12 +13831,10 @@ function buildStudio(node) {
       const importResult = currentOnly
         ? `已导入脚本对应的第${parsedIndex + 1}段到当前段${sel + 1}；前后其他段未修改`
         : `创作界面已解析 ${createSegs.length} 段`;
-      const seg1NoteText = seg1Note ? "；" + seg1Note : "";
       status.textContent = importResult + parsedType
         + "，" + formatParsedDuration(parsedForImport) + formatTailPlanSummary(parsedForImport)
         + mediaNote + assetNote + audioNote + characterAudioNote + "；未匹配资产仍可从资产库拖入需要的分段"
-        + globalNote + audioWarn + parsedWarn + seg1NoteText;
-      if (seg1Note && seg1Note.startsWith("⚠")) status.style.color = "#ff8080";
+        + globalNote + audioWarn + parsedWarn;
       return true;
     };
     btnCreateParse.addEventListener("click", () => { void parseFullCreateScript(); });
